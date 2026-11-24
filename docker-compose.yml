@@ -1,0 +1,137 @@
+name: xing
+
+x-app-env: &app-env
+  APP_ENV: ${APP_ENV:-development}
+  APP_DEBUG: ${APP_DEBUG:-true}
+  APP_SECRET_KEY: ${APP_SECRET_KEY:-dev-only-change-me}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # 应用运行时连接：必须是非超级用户、非表 owner、NOBYPASSRLS 的角色，
+  # 否则 PostgreSQL 整体绕过 RLS，16 条 policy 等于没写（见 scripts/app_role.sql）
+  DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://xing_app:${APP_DB_PASSWORD:-xing_app_dev_pwd}@db:5432/${POSTGRES_DB:-xing}}
+  # 迁移专用：建表需要表 owner 权限，由 entrypoint 里的 alembic 使用
+  DATABASE_ADMIN_URL: ${DATABASE_ADMIN_URL:-postgresql+asyncpg://${POSTGRES_USER:-xing}:${POSTGRES_PASSWORD:-xing_dev_pwd}@db:5432/${POSTGRES_DB:-xing}}
+  REDIS_URL: redis://redis:6379/0
+  SQL_ECHO: ${SQL_ECHO:-false}
+  CORS_ORIGINS: ${CORS_ORIGINS:-*}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+services:
+  db:
+    image: pgvector/pgvector:pg18
+    container_name: xing-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xing}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xing_dev_pwd}
+      POSTGRES_DB: ${POSTGRES_DB:-xing}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # PG18 起数据目录版本化到 /var/lib/postgresql/18/docker，
+      # 挂载父目录才能在未来用 pg_upgrade --link 平滑升到 19
+      - pgdata:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - log_min_duration_statement=200
+      - -c
+      - timezone=Asia/Shanghai
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xing} -d ${POSTGRES_DB:-xing} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: xing-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - "900 1"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+      target: dev
+    container_name: xing-api
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-1}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      # 只挂源码，venv 在 /opt/venv，不会被宿主目录覆盖
+      - ./src:/app/src
+      - ./alembic:/app/alembic
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  adminer:
+    image: adminer:4
+    container_name: xing-adminer
+    restart: unless-stopped
+    profiles: ["tools"]
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+    name: xing-pgdata
+  redisdata:
+    name: xing-redisdata

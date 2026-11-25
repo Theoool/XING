@@ -61,8 +61,15 @@ GRANT SELECT                           ON workspace_members  TO xing_worker;
 GRANT SELECT                           ON strategies         TO xing_worker;
 GRANT SELECT                           ON strategy_versions  TO xing_worker;
 GRANT SELECT                           ON topics             TO xing_worker;
+-- 审批：只能「举手」，不能「决定」。
+--
+-- Reviewer 执行完要留下一条 PENDING，否则「这篇内容在等谁」在库里没有表示，
+-- 人也不知道该看什么。所以给 INSERT。但 select/insert 之外**一条都不给**：
+-- 没有 UPDATE 就无法把 PENDING 改成 APPROVED，没有 DELETE 就无法抹掉待办。
+-- 这比「靠代码不写 UPDATE」强，因为它是数据库层面的事实。
+GRANT SELECT, INSERT                   ON approvals          TO xing_worker;
 
--- 刻意不授权：users（用户资料）、approvals（审批由人做）、feedback、publications。
+-- 刻意不授权：users（用户资料）、feedback、publications。
 -- 需要时单独加，并在这里写清理由。
 
 DO $$

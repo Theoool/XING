@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import DBAPIError
 
@@ -38,7 +40,14 @@ from xing.agents.provider import LlmProvider, LlmResponse, get_provider
 from xing.core.config import settings
 from xing.core.errors import NonRetryableError
 from xing.db.worker import WorkerSession
-from xing.models.runtime import AgentRun, AgentRunStatus, AutonomyMode, LlmCall, LlmCallStatus
+from xing.models.runtime import (
+    AgentRun,
+    AgentRunStatus,
+    AutonomyMode,
+    LlmCall,
+    LlmCallStatus,
+    LlmPurpose,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -64,6 +73,12 @@ class BudgetExceeded(RunError):
 
 class StepBudgetExceeded(BudgetExceeded):
     code = "STEP_BUDGET_EXCEEDED"
+
+
+class InvalidOutput(RunError):
+    """结构化输出两次都不合法。重试没有意义：同样的 prompt 会给同样的垃圾。"""
+
+    code = "INVALID_OUTPUT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,8 +191,14 @@ async def call_model(
     model: str | None = None,
     max_output_tokens: int | None = None,
     allow_replay: bool = True,
+    shape: dict[str, Any] | None = None,
 ) -> LlmResponse:
-    """预留 → 调用（事务外）→ 结算。三步各自独立事务。"""
+    """预留 → 调用（事务外）→ 结算。三步各自独立事务。
+
+    ``shape`` 只被 stub provider 使用（合成一个合法响应）；真实模型靠
+    system prompt 里的输出指令。它不进 ``replay_key``：形状由 Agent 代码决定，
+    不是请求内容，进键只会让「同一请求」被拆成两个键。
+    """
     prov = provider or get_provider()
     mdl = model or settings.llm_model
     max_out = max_output_tokens or price_of(mdl).max_output_tokens
@@ -245,7 +266,7 @@ async def call_model(
     started = time.perf_counter()
     try:
         response = await prov.complete(
-            model=mdl, system=system, prompt=prompt, max_output_tokens=max_out
+            model=mdl, system=system, prompt=prompt, max_output_tokens=max_out, shape=shape
         )
     except BaseException as exc:
         # 取消 / 网络抖动 / 供应商 5xx 都到这里。明细仍然要落 —— 失败调用
@@ -297,6 +318,105 @@ async def call_model(
         latency_ms=latency_ms,
     )
     return response
+
+
+async def call_structured[ModelT: BaseModel](
+    run_id: UUID,
+    *,
+    purpose: str,
+    step_no: int,
+    system: str,
+    prompt: str,
+    schema: type[ModelT],
+    shape: dict[str, Any] | None = None,
+    max_output_tokens: int | None = None,
+) -> ModelT:
+    """要一个**能通过校验**的结构化输出。
+
+    失败只给一次修复机会（``purpose='repair'``），因为修复用的是同一条
+    预算与同一个 step：再多的自动重试也只是把「模型看不明白这个 schema」
+    这件事拖到更贵的地方。两次都不合法 → ``INVALID_OUTPUT``，run 终态。
+
+    修复调用花的是真钱，所以它也走 :func:`call_model`，也就同样被预留/结算
+    与 ``llm_calls`` 覆盖 —— 不因为它叫"修复"就绕开账本。
+    """
+    response = await call_model(
+        run_id,
+        purpose=purpose,
+        step_no=step_no,
+        system=system,
+        prompt=prompt,
+        max_output_tokens=max_output_tokens,
+        shape=shape,
+    )
+    parsed, error = _try_parse(schema, response.text)
+    if parsed is not None:
+        return parsed
+
+    log.warning(
+        "agent.output_invalid", run_id=str(run_id), step=step_no, purpose=purpose, error=error
+    )
+    repaired = await call_model(
+        run_id,
+        purpose=LlmPurpose.REPAIR,
+        step_no=step_no,
+        system=system,
+        prompt=(
+            f"{prompt}\n\n"
+            "上一次输出无法解析为约定结构，错误：\n"
+            f"{error}\n\n"
+            "只输出一个合法 JSON 对象，不要 Markdown 代码块、不要任何解释。"
+        ),
+        max_output_tokens=max_output_tokens,
+        shape=shape,
+    )
+    parsed, error = _try_parse(schema, repaired.text)
+    if parsed is not None:
+        return parsed
+
+    raise InvalidOutput(f"结构化输出两次不合法（{schema.__name__}）：{error}")
+
+
+def _try_parse[ModelT: BaseModel](schema: type[ModelT], text: str) -> tuple[ModelT | None, str]:
+    """解析并校验。返回 (值, 错误描述)，二选一。"""
+    try:
+        return schema.model_validate(_extract_json(text)), ""
+    except (ValueError, ValidationError) as exc:
+        return None, str(exc)[:1500]
+
+
+def _extract_json(text: str) -> Any:
+    """从模型输出里取出那个 JSON 对象。
+
+    只做「剥掉代码块围栏 + 取首尾大括号之间」这两件确定的事，不做容错猜测：
+    真正的容错是让模型重答一次，而不是写一个能吞下任意垃圾的解析器。
+    """
+    body = text.strip()
+    if body.startswith("```"):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+        if body.rstrip().endswith("```"):
+            body = body.rstrip()[:-3]
+
+    start, end = body.find("{"), body.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("输出里没有 JSON 对象")
+    return json.loads(body[start : end + 1])
+
+
+async def record_plan(run_id: UUID, plan: dict[str, Any]) -> None:
+    """把计划写进 ``agent_runs.plan``。
+
+    计划必须落库而不是只留在内存：审计时要能回答「这次执行当初打算做什么」，
+    而事后拿着最终产物去反推计划是做不到的。
+    """
+    async with WorkerSession() as session:
+        await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(plan=plan)
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
 
 
 async def finish_run(run_id: UUID, *, output: dict[str, Any] | None = None) -> bool:

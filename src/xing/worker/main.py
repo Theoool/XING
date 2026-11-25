@@ -5,8 +5,9 @@
     每轮      领取一个任务并执行（队列空则退避 POLL_INTERVAL）
     每 5 秒   把退避到期的 RETRYING 转成 READY
     每 30 秒  回收租约过期的 RUNNING
+    每 120 秒 对账僵尸 run（任务已终态或超时，却还停在 RUNNING）
 
-不做成三个独立协程，是因为它们都要写同一张 tasks 表，
+不做成独立协程，是因为它们都要写同一张 tasks 表，
 分开跑反而要处理互相等待；一个循环里按时间戳节流更简单，也更容易在测试里驱动。
 
 用法：
@@ -26,7 +27,7 @@ import structlog
 
 from xing.core.config import settings
 from xing.core.logging import setup_logging
-from xing.worker import queue, runner
+from xing.worker import queue, reaper, runner
 from xing.worker.db import WorkerSession, dispose
 from xing.worker.handlers import registered_types
 
@@ -35,6 +36,7 @@ log = structlog.get_logger(__name__)
 POLL_INTERVAL = 1.0
 PROMOTE_INTERVAL = 5.0
 RECLAIM_INTERVAL = 30.0
+REAP_INTERVAL = 120.0
 
 
 async def serve(
@@ -54,6 +56,7 @@ async def serve(
 
     last_promote = 0.0
     last_reclaim = 0.0
+    last_reap = 0.0
     idle = 0
 
     while not stop.is_set():
@@ -72,6 +75,14 @@ async def serve(
                 retrying, failed = await queue.reclaim_expired(session)
             if retrying or failed:
                 log.warning("worker.reclaimed", to_retry=retrying, to_failed=failed)
+
+        if now - last_reap >= REAP_INTERVAL:
+            last_reap = now
+            async with WorkerSession() as session:
+                reaped = await reaper.reap_stale_runs(session)
+            if reaped:
+                # 这是异常信号：正常路径上 run 一定在任务终结前收尾。
+                log.warning("worker.reaped_orphan_runs", count=reaped)
 
         try:
             outcome = await runner.claim_and_run(worker_id=worker_id, agent=agent)

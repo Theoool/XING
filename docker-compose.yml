@@ -17,6 +17,12 @@ x-app-env: &app-env
   CORS_ORIGINS: ${CORS_ORIGINS:-*}
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+  # stub = 确定性、不联网（默认，测试与 CI 依赖它）；openai = 真实调用。
+  # 刻意不默认走 openai：一旦默认联网，pytest 会真的花钱，而且结果不再可复现。
+  LLM_PROVIDER: ${LLM_PROVIDER:-stub}
+  LLM_MODEL: ${LLM_MODEL:-stub-1}
+  # 仅对思考型模型（qwen3 等）有意义。留空 = 不发送该字段。
+  LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-}
 
 services:
   db:

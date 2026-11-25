@@ -21,7 +21,8 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xing.core.errors import ApiError
@@ -39,27 +40,60 @@ def _to_out(task: Task) -> TaskOut:
 
 
 async def create_task(session: AsyncSession, *, workspace_id: UUID, payload: TaskCreate) -> TaskOut:
-    task = Task(
-        workspace_id=workspace_id,
-        task_type=payload.task_type,
-        priority=payload.priority,
-        input=payload.input,
+    """创建任务。带 ``dedup_key`` 时幂等 —— 同键第二次提交返回既有行。
+
+    为什么幂等必须在这里而不是在调用方：``plan_content`` 会一次性插入 3-4 个
+    子任务，它在插入与收尾之间崩溃时租约会被回收、任务会重跑。若创建不幂等，
+    重跑就再插一套子任务，同一个 goal 长出两条生产线 —— 两篇内容、两份成本，
+    而且没有任何报错。把去重压到唯一索引上，「计划只展开一次」才是数据库事实，
+    不依赖调用方记得先查。
+    """
+    values = {
+        "workspace_id": workspace_id,
+        "task_type": payload.task_type,
+        "priority": payload.priority,
+        "input": payload.input,
+        "depends_on": payload.depends_on,
+        "assigned_agent": payload.assigned_agent,
+        "dedup_key": payload.dedup_key,
+    }
+
+    if payload.dedup_key is None:
+        task = Task(**values)
+        session.add(task)
+        # flush 触发 INSERT ... RETURNING，把 uuidv7()、now() 这些服务端默认值取回来。
+        await session.flush()
+        # 初始状态**不在这里决定**。触发器 trg_tasks_promote_on_insert 会看
+        # depends_on：无未满足依赖就直接推到 READY，否则留在 PENDING。
+        # 必须 refresh：INSERT ... RETURNING 在 AFTER 触发器之前求值，
+        # 触发器把状态改成 READY 这件事只有重新 SELECT 才看得见。
+        await session.refresh(task)
+        await session.commit()
+        return _to_out(task)
+
+    inserted = await session.scalar(
+        pg_insert(Task)
+        .values(**values)
+        .on_conflict_do_nothing(
+            index_elements=["workspace_id", "dedup_key"],
+            index_where=text("dedup_key IS NOT NULL"),
+        )
+        .returning(Task.id)
     )
-    session.add(task)
-
-    # flush 触发 INSERT ... RETURNING，把 uuidv7()、now() 这些服务端默认值取回来。
-    # 不 flush 直接 commit 也可以，但显式 flush 让"默认值已就绪"这件事在代码里可见。
-    await session.flush()
-
-    # 初始状态**不在这里决定**。触发器 trg_tasks_promote_on_insert 会看
-    # depends_on：无未满足依赖就直接推到 READY，否则留在 PENDING。
-    # 因此不能像以前那样写死 status=PENDING —— 那会和触发器打架，
-    # 且 PENDING→READY 要多走一次 UPDATE。
-    #
-    # 必须 refresh：INSERT ... RETURNING 在 AFTER 触发器之前求值，
-    # 触发器把状态改成 READY 这件事只有重新 SELECT 才看得见。
-    await session.refresh(task)
-
+    if inserted is None:
+        task = (
+            await session.execute(
+                select(Task).where(
+                    Task.workspace_id == workspace_id,
+                    Task.dedup_key == payload.dedup_key,
+                )
+            )
+        ).scalar_one()
+    else:
+        # 重新 SELECT：RETURNING 在 AFTER 触发器之前求值，状态可能是旧的。
+        task = (
+            await session.execute(select(Task).where(Task.id == inserted))
+        ).scalar_one()
     await session.commit()
     return _to_out(task)
 

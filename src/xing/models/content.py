@@ -51,6 +51,12 @@ class Content(Base):
         Uuid,
         ForeignKey("decisions.id", ondelete="SET NULL", name="contents_decision_id_fkey"),
     )
+    #: 产出这篇内容的任务。SET NULL 而不是 CASCADE：任务不会被删（只 CANCELLED），
+    #: 但即便被删，内容作为业务资产也不该跟着消失。
+    source_task_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("tasks.id", ondelete="SET NULL", name="contents_source_task_id_fkey"),
+    )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     # VIDEO_SCRIPT / ARTICLE / POST / AUDIO / OTHER
     content_type: Mapped[str] = mapped_column(
@@ -93,6 +99,13 @@ class Content(Base):
         Index("idx_contents_workspace_updated", "workspace_id", text("updated_at DESC")),
         Index("idx_contents_topic", "topic_id"),
         Index("idx_contents_decision", "decision_id"),
+        # 一个生产任务只产出一篇内容；存在的另一层意义是让「这篇是谁产的」可反查。
+        Index(
+            "contents_source_task",
+            "source_task_id",
+            unique=True,
+            postgresql_where=text("source_task_id IS NOT NULL"),
+        ),
         {"comment": "Durable content assets. Production is a separate lifecycle."},
     )
 

@@ -30,6 +30,9 @@ class TaskContext:
     input: dict[str, Any]
     retry_count: int
     max_retries: int
+    #: 前置任务 id。handler 用它去找上游输出（``agents.upstream``）。
+    #: 顺序由数据库返回顺序决定 —— 依赖是集合，不是序列，任何顺序假设都是错的。
+    depends_on: tuple[UUID, ...] = ()
 
     @classmethod
     def from_task(cls, task: Task) -> "TaskContext":
@@ -40,6 +43,7 @@ class TaskContext:
             input=dict(task.input or {}),
             retry_count=task.retry_count,
             max_retries=task.max_retries,
+            depends_on=tuple(task.depends_on or ()),
         )
 
     @property

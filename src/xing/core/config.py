@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,6 +57,22 @@ class Settings(BaseSettings):
     # 否则整条 Agent 链路在本地无法验证。
     llm_provider: str = "stub"
     llm_model: str = "stub-1"
+
+    # 思考型模型（qwen3 系等）的思维链计入 completion_tokens，既花钱又占
+    # max_output_tokens —— 给 800 上限时正文会被思考挤到截断。
+    # None = 不发送该字段（OpenAI 等不支持此参数，发了会 400）；
+    # False = 通过 extra_body 显式关闭思考。这是供应商相关开关，不是通用语义。
+    llm_enable_thinking: bool | None = None
+
+    @field_validator("llm_enable_thinking", mode="before")
+    @classmethod
+    def _blank_means_unset(cls, value: object) -> object:
+        """compose 用 ``${VAR:-}`` 注入，未设时是空串而不是「未提供」。
+
+        空串必须映射成 None（不发送该字段），否则会被当成 False，
+        语义上等价于「显式关闭思考」—— 对不支持该参数的服务商就是 400。
+        """
+        return None if value == "" else value
 
     @property
     def is_dev(self) -> bool:

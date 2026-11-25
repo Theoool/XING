@@ -46,6 +46,10 @@ PRICES: dict[str, ModelPrice] = {
     # 本地确定性 provider，价格纯属占位：它不产生真实费用，
     # 但预算链路必须有非零价格才能被测试到。
     "stub-1": ModelPrice(Decimal("0.00010"), Decimal("0.00040"), 2048),
+    # 阿里云 MaaS（compatible-mode）上的 flash 档。单价是**预算估算用的近似值**，
+    # 不是账单口径 —— 真实计费以供应商账单为准。留在这里是为了让
+    # 「预留 → 结算」有确定的数字可算，而不是靠猜。
+    "qwen3.7-flash": ModelPrice(Decimal("0.00005"), Decimal("0.00040"), 8192),
 }
 
 

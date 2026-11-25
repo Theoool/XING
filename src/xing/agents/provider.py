@@ -15,6 +15,7 @@
 """
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Protocol
@@ -43,13 +44,32 @@ class LlmProvider(Protocol):
         system: str,
         prompt: str,
         max_output_tokens: int,
+        shape: dict[str, Any] | None = None,
     ) -> LlmResponse: ...
 
 
-class StubProvider:
-    """确定性 provider。同一个 prompt 永远得到同一段文本。
+def fill(shape: Any) -> Any:
+    """按 ``agents.schemas`` 的形状描述合成占位值。确定性，不依赖随机源。
 
-    token 数按字符数估（上界），这样预算测试不会因为估值偏小而在结算时撞 CHECK。
+    只被 ``StubProvider`` 与契约测试使用：它是「没有 key 时的模型」，
+    不是业务逻辑的一部分。
+    """
+    if isinstance(shape, str):
+        if shape.startswith("enum:"):
+            return shape[5:].split("|")[0]
+        return {"str": "stub", "int": 1, "float": 0.5, "bool": True}[shape]
+    if isinstance(shape, list):
+        return [fill(shape[0])] if shape else []
+    return {key: fill(value) for key, value in shape.items()}
+
+
+class StubProvider:
+    """确定性 provider。
+
+    给了 ``shape`` 就返回一个能通过 Pydantic 校验的 JSON 对象 —— 这是让
+    「结构化输出」这条链路在无 key 环境里可测的唯一办法：不 stub、不 mock
+    模型调用，只让这个 provider 按契约合成一个合法响应。
+    没给 ``shape`` 就返回按 prompt 哈希决定的伪文本（写作类 Agent 用）。
     """
 
     name = "stub"
@@ -61,13 +81,15 @@ class StubProvider:
         system: str,
         prompt: str,
         max_output_tokens: int,
+        shape: dict[str, Any] | None = None,
     ) -> LlmResponse:
-        digest = hashlib.sha256(f"{system}\x00{prompt}".encode()).hexdigest()
-        seed = int(digest[:8], 16)
-
-        # 输出长度在 120~520 字之间，且完全由 prompt 决定。
-        length = 120 + seed % 400
-        body = _pseudo_text(seed, length)
+        if shape is not None:
+            body = json.dumps(fill(shape), ensure_ascii=False)
+        else:
+            digest = hashlib.sha256(f"{system}\x00{prompt}".encode()).hexdigest()
+            seed = int(digest[:8], 16)
+            # 输出长度在 120~520 字之间，且完全由 prompt 决定。
+            body = _pseudo_text(seed, 120 + seed % 400)
 
         return LlmResponse(
             text=body,
@@ -93,11 +115,17 @@ def _pseudo_text(seed: int, length: int) -> str:
 class OpenAIProvider:
     name = "openai"
 
-    def __init__(self, *, api_key: str, base_url: str = "") -> None:
+    def __init__(
+        self, *, api_key: str, base_url: str = "", enable_thinking: bool | None = None
+    ) -> None:
         # 延迟导入：不选 openai 的环境里不该因为缺包而起不来。
         from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+        # None 表示完全不发这个字段：它是 qwen 系私有参数，发给 OpenAI 会 400。
+        self._extra_body = (
+            {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+        )
 
     async def complete(
         self,
@@ -106,7 +134,10 @@ class OpenAIProvider:
         system: str,
         prompt: str,
         max_output_tokens: int,
+        shape: dict[str, Any] | None = None,
     ) -> LlmResponse:
+        # shape 只对 stub 有意义：真实模型靠 system 里的输出指令，
+        # 把结构描述塞进 prompt 只会多花 token。
         resp = await self._client.chat.completions.create(
             model=model,
             messages=[
@@ -115,6 +146,7 @@ class OpenAIProvider:
             ],
             max_tokens=max_output_tokens,
             temperature=0.7,
+            extra_body=self._extra_body or None,
         )
         choice = resp.choices[0]
         text = choice.message.content or ""
@@ -138,5 +170,9 @@ def get_provider() -> LlmProvider:
     if settings.llm_provider == "openai":
         if not settings.openai_api_key:
             raise RuntimeError("llm_provider=openai 但没有 openai_api_key")
-        return OpenAIProvider(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+        return OpenAIProvider(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+            enable_thinking=settings.llm_enable_thinking,
+        )
     return StubProvider()

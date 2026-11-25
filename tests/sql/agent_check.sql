@@ -1,10 +1,12 @@
--- Agent 层数据库契约验证（0005 + 0006）
+-- Agent 层数据库契约验证（0005 + 0006 + 0008）
 --
--- 验证四件"靠文档说不清、只能靠穷举证明"的事：
+-- 验证六件"靠文档说不清、只能靠穷举证明"的事：
 --   1. guard_task_status_transition 只放行 15 条迁移边（+ 8 条同态 no-op）
 --   2. promote_dependent_tasks / promote_task_if_ready 在依赖满足时推进状态
 --   3. rollup_llm_call_cost 累加正确，且超预算时被 CHECK 拦下
 --   4. lease_generation 让旧代次的写入落空（fencing）
+--   5. dedup_key 让同一计划步骤只能存在一行（否则重跑长出第二条生产线）
+--   6. 上游永久失败时后代全部 CANCELLED（否则任务图静默卡死）
 --
 -- 用法：
 --   docker compose exec -T db psql -U xing -d xing -v ON_ERROR_STOP=1 -f - < tests/sql/agent_check.sql
@@ -34,6 +36,8 @@ DECLARE
     v_task     uuid;
     v_a        uuid;
     v_b        uuid;
+    v_c        uuid;
+    v_key      text;
     v_allowed  boolean;
     v_expected boolean;
     v_cases    int := 0;
@@ -292,6 +296,59 @@ BEGIN
     END IF;
 
     RAISE NOTICE 'ok  租约 fencing：旧代次写入落空，当前代次可写';
+
+    -- ---------- 5. 计划幂等（0008） ----------
+    -- 租约丢失后 plan_content 会重跑，重跑不能长出第二条生产线。
+    -- 这条唯一性只能由数据库保证：应用层的「先查再插」在并发下必然漏。
+    INSERT INTO tasks (workspace_id, task_type, dedup_key)
+    VALUES (v_ws, 'AGENTCHECK', 'plan:' || gen_random_uuid()::text)
+    RETURNING dedup_key INTO v_key;
+
+    BEGIN
+        INSERT INTO tasks (workspace_id, task_type, dedup_key)
+        VALUES (v_ws, 'AGENTCHECK', v_key);
+        RAISE EXCEPTION 'dedup_key 唯一性失效：同 workspace 同键插入了第二行';
+    EXCEPTION WHEN unique_violation THEN
+        RAISE NOTICE 'ok  dedup_key：同键重复插入被唯一索引拒绝';
+    END;
+
+    -- ---------- 6. 失败向下传播（0008） ----------
+    -- 上游永久 FAILED 后，所有后代必须被取消。缺了这条，任务图会静默卡死：
+    -- 没有报错、没有告警，只是下游永远 PENDING。
+    INSERT INTO tasks (workspace_id, task_type) VALUES (v_ws, 'AGENTCHECK')
+    RETURNING id INTO v_a;
+    INSERT INTO tasks (workspace_id, task_type, depends_on)
+    VALUES (v_ws, 'AGENTCHECK', ARRAY[v_a]) RETURNING id INTO v_b;
+    INSERT INTO tasks (workspace_id, task_type, depends_on)
+    VALUES (v_ws, 'AGENTCHECK', ARRAY[v_b]) RETURNING id INTO v_c;
+
+    -- 走真实路径：READY -> RUNNING -> FAILED（guard 不允许 READY 直接到 FAILED）
+    UPDATE tasks
+       SET status = 'RUNNING', locked_by = 'worker-X',
+           locked_at = now(), lease_expires_at = now() + interval '90 seconds'
+     WHERE id = v_a AND status = 'READY';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '构造失败场景失败：v_a 不在 READY';
+    END IF;
+
+    UPDATE tasks
+       SET status = 'FAILED', completed_at = now(), locked_by = NULL,
+           locked_at = NULL, lease_expires_at = NULL
+     WHERE id = v_a;
+
+    IF (SELECT status FROM tasks WHERE id = v_b) <> 'CANCELLED' THEN
+        RAISE EXCEPTION '失败未传播：直接下游仍是 %',
+            (SELECT status FROM tasks WHERE id = v_b);
+    END IF;
+    IF (SELECT status FROM tasks WHERE id = v_c) <> 'CANCELLED' THEN
+        RAISE EXCEPTION '失败未传播到底：隔代下游仍是 %',
+            (SELECT status FROM tasks WHERE id = v_c);
+    END IF;
+    IF (SELECT error->>'code' FROM tasks WHERE id = v_c) <> 'UPSTREAM_FAILED' THEN
+        RAISE EXCEPTION '取消原因未落库：%', (SELECT error FROM tasks WHERE id = v_c);
+    END IF;
+
+    RAISE NOTICE 'ok  失败传播：两层下游都被取消，原因记为 UPSTREAM_FAILED';
 
     DELETE FROM tasks WHERE task_type = 'AGENTCHECK';
 

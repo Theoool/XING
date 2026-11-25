@@ -67,6 +67,13 @@ class Task(Base):
         ARRAY(Uuid), nullable=False, server_default=text("'{}'::uuid[]")
     )
 
+    #: 计划幂等键。同一 workspace 内同键只允许存在一行。
+    #:
+    #: 存在的唯一理由：``plan_content`` 因租约丢失重跑时会再插一套子任务，
+    #: 而租约回收是常态路径，不是异常。没有这条唯一约束，同一个 goal 会长出
+    #: 两条生产线 —— 两篇内容、两份成本、两套审批，且都没有报错。
+    dedup_key: Mapped[str | None] = mapped_column(Text)
+
     retry_count: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
     max_retries: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("3"))
 
@@ -121,6 +128,14 @@ class Task(Base):
             postgresql_where=text("status = 'READY'"),
         ),
         Index("idx_tasks_depends_on", "depends_on", postgresql_using="gin"),
+        # 部分唯一索引：绝大多数任务没有 dedup_key，不该进索引。
+        Index(
+            "tasks_dedup_key",
+            "workspace_id",
+            "dedup_key",
+            unique=True,
+            postgresql_where=text("dedup_key IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:

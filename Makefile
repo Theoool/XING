@@ -51,8 +51,8 @@ approle: ## 创建/修复 xing_app 应用角色并授权（RLS 前提）
 	$(COMPOSE) exec -T db psql -U $${POSTGRES_USER:-xing} -d $${POSTGRES_DB:-xing} \
 	  -v ON_ERROR_STOP=1 -f - < scripts/app_role.sql
 
-dbsmoke: ## 数据库回归：全链路冒烟 + P0 约束（自动回滚）
-	@for f in tests/sql/smoke_v01.sql tests/sql/p0_check.sql; do \
+dbsmoke: ## 数据库回归：全链路冒烟 + P0 约束 + Agent 层契约（自动回滚）
+	@for f in tests/sql/smoke_v01.sql tests/sql/p0_check.sql tests/sql/agent_check.sql; do \
 	  echo "== $$f =="; \
 	  $(COMPOSE) exec -T db psql -U $${POSTGRES_USER:-xing} -d $${POSTGRES_DB:-xing} \
 	    -v ON_ERROR_STOP=1 -f - < $$f || exit 1; \

@@ -17,6 +17,8 @@ usage() {
 用法: ./dev.sh <命令>
 
   up          启动全部服务
+  worker      启动后台执行进程（profile: worker，默认不跑）
+  workerlog   跟踪 worker 日志
   build       重建 api 镜像（改了 pyproject.toml 后必须执行）
   down        停止并移除容器（保留数据卷）
   stop        仅停止容器
@@ -29,7 +31,8 @@ usage() {
   redis       进入 redis-cli
   migrate     应用迁移到最新
   approle     创建/修复 xing_app 应用角色并授权（RLS 依赖它）
-  dbsmoke     数据库回归：全链路冒烟 + P0 约束（均自动回滚）
+  workerrole  创建/修复 xing_worker 后台执行角色（唯一 BYPASSRLS 角色）
+  dbsmoke     数据库回归：全链路冒烟 + P0 约束 + Agent 契约（均自动回滚）
   rlscheck    以 xing_app 角色验证 RLS 隔离（自动回滚）
   ormcheck    校验 ORM 模型与数据库是否一致（空 diff 才算通过）
   revision    生成迁移，例: ./dev.sh revision "add topics table"
@@ -57,12 +60,14 @@ case "$cmd" in
   logs)      "${COMPOSE[@]}" logs -f api ;;
   logs-all)  "${COMPOSE[@]}" logs -f ;;
   ps)        "${COMPOSE[@]}" ps ;;
+  worker)    "${COMPOSE[@]}" --profile worker up -d worker ;;
+  workerlog) "${COMPOSE[@]}" --profile worker logs -f worker ;;
   sh)        "${COMPOSE[@]}" exec api bash ;;
   db)        "${COMPOSE[@]}" exec db psql -U "${POSTGRES_USER:-xing}" -d "${POSTGRES_DB:-xing}" ;;
   redis)     "${COMPOSE[@]}" exec redis redis-cli ;;
   migrate)   "${COMPOSE[@]}" exec api alembic upgrade head ;;
   dbsmoke)
-    for f in tests/sql/smoke_v01.sql tests/sql/p0_check.sql; do
+    for f in tests/sql/smoke_v01.sql tests/sql/p0_check.sql tests/sql/agent_check.sql; do
       echo "== ${f} =="
       "${COMPOSE[@]}" exec -T db psql \
         -U "${POSTGRES_USER:-xing}" -d "${POSTGRES_DB:-xing}" \
@@ -73,6 +78,11 @@ case "$cmd" in
     "${COMPOSE[@]}" exec -T db psql \
       -U "${POSTGRES_USER:-xing}" -d "${POSTGRES_DB:-xing}" \
       -v ON_ERROR_STOP=1 -f - < scripts/app_role.sql
+    ;;
+  workerrole)
+    "${COMPOSE[@]}" exec -T db psql \
+      -U "${POSTGRES_USER:-xing}" -d "${POSTGRES_DB:-xing}" \
+      -v ON_ERROR_STOP=1 -f - < scripts/worker_role.sql
     ;;
   rlscheck)
     "${COMPOSE[@]}" exec -T -e PGPASSWORD="${APP_DB_PASSWORD:-xing_app_dev_pwd}" db psql \

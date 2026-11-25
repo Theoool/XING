@@ -21,6 +21,7 @@ DECLARE
     v_prod      uuid;
     v_pub1      uuid;
     v_pub2      uuid;
+    v_run       uuid;
     v_after     timestamptz;
 BEGIN
     INSERT INTO users (email, display_name)
@@ -124,10 +125,25 @@ BEGIN
     INSERT INTO feedback (workspace_id, content_id, feedback_type, rating, created_by)
     VALUES (v_ws, v_content, 'HUMAN_REVIEW', 4.5, v_user);
 
-    INSERT INTO agent_runs
-        (workspace_id, agent_name, model_provider, model_name, input_tokens, output_tokens, cost, status)
+    -- 0005 起 agent_runs 是 run 级（goal/plan/预算），一次模型调用记 llm_calls。
+    INSERT INTO agent_runs (workspace_id, agent_name, goal, status, completed_at)
+    VALUES (v_ws, 'writer', 'smoke: produce one content', 'SUCCEEDED', now())
+    RETURNING id INTO v_run;
+
+    INSERT INTO llm_calls
+        (workspace_id, run_id, model_provider, model_name, purpose, call_seq,
+         input_tokens, output_tokens, cost, status)
     VALUES
-        (v_ws, 'writer', 'openai', 'gpt-4o-mini', 1200, 800, 0.0012, 'SUCCEEDED');
+        (v_ws, v_run, 'openai', 'gpt-4o-mini', 'generate', 1,
+         1200, 800, 0.0012, 'SUCCEEDED');
+
+    -- 成本由触发器累加到 run 上，这里顺带验证一次
+    IF NOT EXISTS (
+        SELECT 1 FROM agent_runs
+         WHERE id = v_run AND total_tokens = 2000 AND total_cost = 0.0012
+    ) THEN
+        RAISE EXCEPTION 'llm_calls 成本未累加到 agent_runs';
+    END IF;
 
     RAISE NOTICE 'ok: full core loop inserted';
 

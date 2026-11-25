@@ -25,9 +25,15 @@ SET LOCAL app.workspace_id = :'wa';
 
 INSERT INTO contents (workspace_id, title, created_by) VALUES (:'wa', 'A 的内容', :'ua');
 INSERT INTO topics (workspace_id, title) VALUES (:'wa', 'A 的选题');
+INSERT INTO agent_runs (workspace_id, agent_name, goal)
+VALUES (:'wa', 'writer', 'rls check') RETURNING id AS run_a \gset
+INSERT INTO llm_calls (workspace_id, run_id, model_provider, model_name, purpose, call_seq)
+VALUES (:'wa', :'run_a', 'openai', 'gpt-x', 'generate', 1);
 
 SELECT 'A@WA 可见内容' AS check, count(*) AS n FROM contents;
 SELECT 'A@WA 可见选题' AS check, count(*) AS n FROM topics;
+SELECT 'A@WA 可见 run' AS check, count(*) AS n FROM agent_runs;
+SELECT 'A@WA 可见 llm_call' AS check, count(*) AS n FROM llm_calls;
 
 -- B 拿着 WA 的上下文，应当看不到任何东西
 SET LOCAL app.user_id = :'ub';
@@ -35,6 +41,8 @@ SET LOCAL app.workspace_id = :'wa';
 
 SELECT 'B@WA 可见内容(应 0)' AS check, count(*) AS n FROM contents;
 SELECT 'B@WA 可见选题(应 0)' AS check, count(*) AS n FROM topics;
+SELECT 'B@WA 可见 run(应 0)' AS check, count(*) AS n FROM agent_runs;
+SELECT 'B@WA 可见 llm_call(应 0)' AS check, count(*) AS n FROM llm_calls;
 
 -- B 尝试往 WA 里写，应被 WITH CHECK 拒绝
 DO $t$
@@ -54,6 +62,7 @@ $t$;
 -- 清空上下文，默认应当什么都看不到
 SELECT set_config('app.workspace_id', '', true), set_config('app.user_id', '', true);
 SELECT '无上下文可见内容(应 0)' AS check, count(*) AS n FROM contents;
+SELECT '无上下文可见 run(应 0)' AS check, count(*) AS n FROM agent_runs;
 
 ROLLBACK;
 

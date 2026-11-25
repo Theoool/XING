@@ -8,6 +8,8 @@ x-app-env: &app-env
   # 应用运行时连接：必须是非超级用户、非表 owner、NOBYPASSRLS 的角色，
   # 否则 PostgreSQL 整体绕过 RLS，16 条 policy 等于没写（见 scripts/app_role.sql）
   DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://xing_app:${APP_DB_PASSWORD:-xing_app_dev_pwd}@db:5432/${POSTGRES_DB:-xing}}
+  # 后台 worker 连接：唯一 BYPASSRLS 角色，用于跨租户领取任务（见 scripts/worker_role.sql）
+  WORKER_DATABASE_URL: ${WORKER_DATABASE_URL:-postgresql+asyncpg://xing_worker:${WORKER_DB_PASSWORD:-xing_worker_dev_pwd}@db:5432/${POSTGRES_DB:-xing}}
   # 迁移专用：建表需要表 owner 权限，由 entrypoint 里的 alembic 使用
   DATABASE_ADMIN_URL: ${DATABASE_ADMIN_URL:-postgresql+asyncpg://${POSTGRES_USER:-xing}:${POSTGRES_PASSWORD:-xing_dev_pwd}@db:5432/${POSTGRES_DB:-xing}}
   REDIS_URL: redis://redis:6379/0
@@ -97,6 +99,7 @@ services:
     environment:
       <<: *app-env
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-1}
+      PROCESS_ROLE: api
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
@@ -116,6 +119,33 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
+
+  # 后台执行进程。默认不启动：`docker compose --profile worker up -d`
+  #
+  # 与 api 共用镜像，但连接身份相反（BYPASSRLS），所以 entrypoint 会走
+  # worker 分支的角色检查。RUN_MIGRATIONS=0：迁移只由 api 容器做，
+  # 两个进程同时跑 alembic 会互相等锁。
+  worker:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+      target: dev
+    container_name: xing-worker
+    restart: unless-stopped
+    profiles: ["worker"]
+    command: python -m xing.worker.main
+    environment:
+      <<: *app-env
+      RUN_MIGRATIONS: "0"
+      PROCESS_ROLE: worker
+    volumes:
+      - ./src:/app/src
+      - ./alembic:/app/alembic
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   adminer:
     image: adminer:4

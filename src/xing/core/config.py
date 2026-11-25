@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     # 留空则复用 database_url（此时该角色必须有 DDL 权限）。
     database_admin_url: str = ""
 
+    # 后台 worker 专用连接。
+    # 必须与 database_url 分开：worker 的领取查询要跨租户扫 tasks，
+    # 而 xing_app 是 NOBYPASSRLS 且每条 policy 都要求 app.workspace_id 匹配，
+    # 用应用角色连接会导致队列只能看到「当前上下文租户」的任务。
+    # 见 scripts/worker_role.sql 与 docs/AGENT_DESIGN.md §8.0。
+    worker_database_url: str = (
+        "postgresql+asyncpg://xing_worker:xing_worker_dev_pwd@localhost:5432/xing"
+    )
+
     sql_echo: bool = False
     db_pool_size: int = 10
     db_max_overflow: int = 20
@@ -41,6 +50,12 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_base_url: str = ""
+
+    # stub = 确定性、不联网（默认）。openai = 真实调用，需要 key。
+    # 默认 stub 的理由：没有 key 也要能把「预算 → 调用 → 记账 → 回放」跑通，
+    # 否则整条 Agent 链路在本地无法验证。
+    llm_provider: str = "stub"
+    llm_model: str = "stub-1"
 
     @property
     def is_dev(self) -> bool:

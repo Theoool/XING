@@ -272,7 +272,9 @@ async def test_task_cancel_persists_reason(client: AsyncClient, workspace: dict)
     )
     assert created.status_code == 201, created.text
     task = created.json()
-    assert task["status"] == "PENDING"
+    # 无依赖的任务创建即 READY（触发器 trg_tasks_promote_on_insert），
+    # 不再是 PENDING —— 否则队列里没人会推进它。
+    assert task["status"] == "READY"
     assert task["error"] is None
 
     cancelled = await client.post(
@@ -309,7 +311,7 @@ async def test_task_orm_keeps_rls_and_contract(client: AsyncClient, workspace: d
     assert created.status_code == 201, created.text
     task = created.json()
 
-    assert task["status"] == "PENDING"
+    assert task["status"] == "READY"  # 无依赖 → 创建即 READY
     assert task["priority"] == 3
     assert task["input"] == {"resolution": "1080p"}
     assert task["output"] is None
@@ -355,6 +357,6 @@ async def test_task_orm_keeps_rls_and_contract(client: AsyncClient, workspace: d
     )
     assert hijack.status_code == 404
 
-    # 仍然停在 PENDING，说明上面那次 cancel 一个字段都没写到
+    # 仍然是 READY，说明上面那次 cancel 一个字段都没写到
     still = await client.get(f"{API}/workspaces/{workspace_id}/tasks/{task['id']}")
-    assert still.json()["status"] == "PENDING"
+    assert still.json()["status"] == "READY"

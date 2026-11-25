@@ -42,7 +42,6 @@ async def create_task(session: AsyncSession, *, workspace_id: UUID, payload: Tas
     task = Task(
         workspace_id=workspace_id,
         task_type=payload.task_type,
-        status=TaskStatus.PENDING,
         priority=payload.priority,
         input=payload.input,
     )
@@ -51,6 +50,16 @@ async def create_task(session: AsyncSession, *, workspace_id: UUID, payload: Tas
     # flush 触发 INSERT ... RETURNING，把 uuidv7()、now() 这些服务端默认值取回来。
     # 不 flush 直接 commit 也可以，但显式 flush 让"默认值已就绪"这件事在代码里可见。
     await session.flush()
+
+    # 初始状态**不在这里决定**。触发器 trg_tasks_promote_on_insert 会看
+    # depends_on：无未满足依赖就直接推到 READY，否则留在 PENDING。
+    # 因此不能像以前那样写死 status=PENDING —— 那会和触发器打架，
+    # 且 PENDING→READY 要多走一次 UPDATE。
+    #
+    # 必须 refresh：INSERT ... RETURNING 在 AFTER 触发器之前求值，
+    # 触发器把状态改成 READY 这件事只有重新 SELECT 才看得见。
+    await session.refresh(task)
+
     await session.commit()
     return _to_out(task)
 

@@ -1,4 +1,4 @@
-"""业务模型集中导出。19 张业务表全部映射。
+"""业务模型集中导出。20 张业务表全部映射。
 
 Alembic 的 autogenerate 依赖这里的导入来发现所有继承 Base 的模型，
 新增模型文件后必须在这里 import 一次，否则 ``alembic check`` 会把那张表
@@ -37,7 +37,14 @@ from xing.models.production import (
     Publication,
     PublicationStatus,
 )
-from xing.models.runtime import AgentRun, AgentRunStatus
+from xing.models.runtime import (
+    AgentRun,
+    AgentRunStatus,
+    AutonomyMode,
+    LlmCall,
+    LlmCallStatus,
+    LlmPurpose,
+)
 from xing.models.strategy import Strategy, StrategyStatus, StrategyVersion
 from xing.models.task import Task, TaskStatus
 from xing.models.topic import Topic, TopicEvent, TopicEventRole, TopicStatus
@@ -49,6 +56,7 @@ __all__ = [
     "Approval",
     "ApprovalStage",
     "ApprovalStatus",
+    "AutonomyMode",
     "Base",
     "Content",
     "ContentStatus",
@@ -61,6 +69,9 @@ __all__ = [
     "ExternalEvent",
     "Feedback",
     "FeedbackType",
+    "LlmCall",
+    "LlmCallStatus",
+    "LlmPurpose",
     "PerformanceSnapshot",
     "Production",
     "ProductionStatus",

@@ -1136,7 +1136,19 @@ selected_option, rationale, score, decided_by, decided_at, created_at, traces[]`
 
 ## 10. 任务 Tasks
 
-后端异步执行的统一入口。**当前没有 worker，任务只会停在 `PENDING`。**
+后端异步执行的统一入口。**已有 worker（Phase 1a 完成）：无依赖的任务创建即 `READY`，会被领取执行。**
+
+初始状态**不由 API 决定**，而是由触发器 `trg_tasks_promote_on_insert` 按 `depends_on` 判定：
+无未满足依赖 → 直接 `READY`；有未满足依赖 → `PENDING`，等上游完成。当前 API 的 `TaskCreate`
+不接受 `depends_on`，所以**通过 API 创建的任务一律是 `READY`**。
+
+> 由此带来一个必须知道的后果：`task_type` 没有注册对应 handler 时，worker 领取后会
+> 立即把它标成 `FAILED`，`error.code = "NO_HANDLER"`。
+>
+> 当前已注册两个：`echo`（回声，验证链路）与 `write_content`（真实 Agent，产出
+> `contents` 草稿）。`write_content` 的 `input` 形如
+> `{"brief": "...", "title": "...", "content_type": "ARTICLE", "max_cost": 2.0}`，
+> 执行完可用返回的 `output.content_id` 去 `GET /contents/{id}` 取草稿。
 
 接口先立起来，是因为「生产/发布」这类长任务从第一天就该走
 `202 + task_id + 轮询`，而不是让 HTTP 请求等 FFmpeg 跑完。
@@ -1157,13 +1169,13 @@ selected_option, rationale, score, decided_by, decided_at, created_at, traces[]`
 | `priority` | int | 否 | -100 ~ 100，默认 0（越大越优先） |
 | `input` | object | 否 | 默认 `{}` |
 
-**响应 201**：`TaskOut`（`status = PENDING`）
+**响应 201**：`TaskOut`（无依赖 → `status = READY`）
 
 ```json
 {
   "id": "0193f310-aaaa-7c4e-8a3b-0f5c8b6e4a12",
   "task_type": "RENDER_VIDEO",
-  "status": "PENDING",
+  "status": "READY",
   "priority": 10,
   "input": { "content_id": "0193f2f0-...", "resolution": "1080p" },
   "output": null,
@@ -1222,10 +1234,11 @@ POST /workspaces/{workspace_id}/tasks/{task_id}/cancel?reason=用户放弃
 | 404 | `TASK_NOT_FOUND` | |
 | 409 | `TASK_NOT_CANCELLABLE` | 任务已进入 `SUCCEEDED` / `FAILED` / `CANCELLED` |
 
-**只有 `PENDING` / `RUNNING` / `WAITING` 可以取消。**
+**只有 `PENDING` / `READY` / `RUNNING` / `WAITING` / `RETRYING` 可以取消**（终态不可逆）。
 
 > 当前 `cancel` 只改数据库状态。真正停掉一个正在跑的进程需要 worker 侧配合
-> （检查取消标记 / 终止子进程），接 worker 时必须补齐。
+> （检查租约 / 终止子进程）。`RUNNING` 的取消会在租约续期失败时被 worker 感知，
+> 见 `docs/AGENT_DESIGN.md` §8.2。
 
 ---
 
@@ -1329,13 +1342,26 @@ DRAFT ──approve──> APPROVED ──(生产)──> PRODUCING ──> READ
 ### 任务 `tasks.status`
 
 ```
-PENDING ──(worker 领取)──> RUNNING ──> SUCCEEDED
-   │                          │
-   │                          └──> FAILED
-   └──cancel──> CANCELLED <──cancel── RUNNING / WAITING
+                 ┌──── depends_on 全部 SUCCEEDED（或创建时已满足）────┐
+                 ▼                                                   │
+PENDING ─────> READY ──(worker 领取)──> RUNNING ──> SUCCEEDED       │
+   │             │                        │                          │
+   │             │                        ├──> FAILED（重试耗尽）    │
+   │             │                        ├──> WAITING（等审批）     │
+   │             │                        └──> RETRYING ─────────────┘
+   │             │                                  （退避到期回 READY）
+   └─────────────┴──────────────> CANCELLED <───────┘
 ```
 
-当前只有 `PENDING` 与 `CANCELLED` 会被真正写出来。
+合法迁移由数据库函数 `app.guard_task_status_transition` 守卫（0005 迁移），
+非法迁移直接抛 `check_violation`，不依赖服务层的 if。
+
+**推进方**：`PENDING→READY` 由触发器（创建时判定 / 上游完成）；`READY→RUNNING`、
+`RUNNING→{SUCCEEDED,FAILED,WAITING,RETRYING}` 由 worker 写，且必须带当前 `lease_generation`；
+`RETRYING→READY` 由 worker 的推进循环；`CANCELLED` 由 API。
+
+**API 现在会写出 `READY`（创建无依赖任务）与 `CANCELLED`（用户取消）**；
+其余状态由 worker 推进。详见 `docs/AGENT_DESIGN.md` §3.3 与 §8.3。
 
 ### 审批 `approvals.status`
 
@@ -1389,7 +1415,8 @@ CID=$(curl -s -X POST localhost:8000/api/v1/workspaces/$WS/contents \
 curl -s -X POST localhost:8000/api/v1/workspaces/$WS/contents/$CID/approve \
   -H 'Content-Type: application/json' -d '{"comment":"可以发"}'
 
-# 8) 建生产任务（会停在 PENDING，等 worker）
+# 8) 建生产任务（无依赖 → 立即 READY，worker 会来领）
+#    当前只有 echo handler，RENDER_VIDEO 会被 worker 标成 FAILED(NO_HANDLER)
 curl -s -X POST localhost:8000/api/v1/workspaces/$WS/tasks \
   -H 'Content-Type: application/json' \
   -d "{\"task_type\":\"RENDER_VIDEO\",\"input\":{\"content_id\":\"$CID\"}}"
@@ -1418,7 +1445,8 @@ curl -s -X POST -H "X-User-ID: $AID" -H 'Content-Type: application/json' \
 
 | 缺口 | 影响 | 位置 |
 |---|---|---|
-| **没有 worker** | `tasks` 永远停在 `PENDING`；`cancel` 只改库不改进程 | `services/task_service.py` |
+| **只有 echo handler** | 其他 `task_type` 被 worker 领到后立即 `FAILED(NO_HANDLER)`；API 建的渲染任务基本都会走这条路 | `worker/handlers.py` |
+| **`cancel` 不中断正在跑的执行** | 只改数据库状态；已领取的任务要等 worker 下一次 `finalize` 被 fence 掉，或执行完才发现 | `worker/runner.py` |
 | **没有认证** | `X-User-ID` 可任意伪造成任何人 | `api/deps.py::get_current_user_id` |
 | **`recommend` 不含 LLM** | 打分是规则式，`risk_score` 恒 `null`；无去重/语义聚类 | `services/topic_service.py` |
 | **列表不返回 `current_version`** | 内容列表拿不到正文，需逐个调详情 | `services/content_service.py::list_contents` |

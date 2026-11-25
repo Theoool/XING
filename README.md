@@ -61,12 +61,15 @@ docker compose up -d          # 首次会构建镜像，约 1-3 分钟
 │   │   ├── routes/health.py    # 探针
 │   │   └── v1/                 # 业务路由（workspaces/strategies/...）
 │   ├── schemas/                # Pydantic 请求/响应模型
-│   ├── models/                 # 19 张表的 ORM 映射（唯一 schema 真相）
-│   └── services/               # 业务逻辑（全部 ORM，无手写 SQL）
+│   ├── models/                 # 20 张表的 ORM 映射（唯一 schema 真相）
+│   ├── services/               # 业务逻辑（全部 ORM，无手写 SQL）
+│   ├── worker/                 # 队列：领取 / 续租 / 回收 / 收尾（fencing）
+│   └── agents/                 # Agent 运行时：定价 / provider / runtime / writer
 ├── alembic/
 │   ├── sql/v01_schema.sql      # v0.1 DDL 正文
-│   └── versions/               # 迁移（0003 = P0 修复，0004 = 选题唯一性）
+│   └── versions/               # 迁移：0003 P0、0004 选题唯一、0005 Agent 层、0006 fencing、0007 契约收紧
 ├── scripts/app_role.sql        # 应用角色与授权（RLS 前提）
+├── scripts/worker_role.sql     # worker 角色（BYPASSRLS，仅运行期表）
 ├── docker/postgres/init/       # 首次建库：扩展、参数、应用角色
 └── tests/
     ├── sql/                    # smoke_v01 / p0_check / rls_check
@@ -149,7 +152,7 @@ workspace → strategy(+v1) → 新增版本 → activate
       → topics/recommend（打分排序）
       → topics/{id}/select（自动落一条绑定当前战略版本的决策）
       → contents（+versions）→ approve / reject
-      → tasks（PENDING，等 worker）
+      → tasks（无依赖则创建即 READY，等 worker 领取）
 ```
 
 共 39 个端点，全部可在 <http://localhost:8000/docs> 直接试。
@@ -165,10 +168,12 @@ workspace → strategy(+v1) → 新增版本 → activate
 
 ### 几个已知缺口
 
-- `tasks` 只会停在 `PENDING`：没有 worker，`cancel` 也只改数据库状态。
+- **已有一个真实 Agent**：`write_content` 会把任务变成 `contents` + v1 草稿，并留下
+  `agent_runs` / `llm_calls` 完整账目。但只有这一个，编排（Planner / 多 Agent 串联）还没做（Phase 2）。
+- 默认 provider 是 `stub`（确定性、不联网）。要接真实模型需设 `LLM_PROVIDER=openai` + `OPENAI_API_KEY`。
 - `recommend` 的打分是规则式（战略关键词命中率 / 24h 衰减 / 素材完备度），不含 LLM；`risk_score` 恒为 NULL，留给 AI Runtime。
 - `dev/users` 接口只在 development 下可用，它没有鉴权，不能带进生产。
-- **ORM 已全覆盖**：19 张表全部有映射（`src/xing/models/`），服务层与路由里**没有手写 SQL**，
+- **ORM 已全覆盖**：20 张表全部有映射（`src/xing/models/`），服务层与路由里**没有手写 SQL**，
   全部走 `select()` / `update()` / `pg_insert()`。唯一保留的 `text()` 是 RLS 上下文注入
   （`set_config`）和健康检查的 `select 1`。
   `./dev.sh ormcheck`（`alembic check`）是漂移防线：模型改了但没写迁移时它会报出待执行的 upgrade。
@@ -176,6 +181,7 @@ workspace → strategy(+v1) → 新增版本 → activate
 ## 数据库
 
 v0.1 schema 共 **19 张表**，迁移 `0002_v01_schema`，DDL 正文在 `alembic/sql/v01_schema.sql`，可直接审阅和 diff。
+`0005_agent_layer` 把 `agent_runs` 正名为 `llm_calls` 并新增 run 级的 `agent_runs`，现共 **20 张表**。
 
 `0003_p0_fixes` 是它的修正补丁，只加约束不加表：
 
@@ -196,19 +202,72 @@ v0.1 schema 共 **19 张表**，迁移 `0002_v01_schema`，DDL 正文在 `alembi
 | 内容 | `contents` `content_versions` |
 | 生产与发布 | `tasks` `productions` `publications` |
 | 效果与反馈 | `performance_snapshots` `feedback` `approvals` |
-| AI 运行时 | `agent_runs` |
+| AI 运行时 | `agent_runs`（一次执行）`llm_calls`（一次模型调用） |
+
+### 后台执行
+
+`tasks` 是唯一队列，worker 是 `tasks.status` 的唯一写入者（Agent 只写业务数据与 `agent_runs`）。
+
+```bash
+./dev.sh workerrole   # 一次性：创建 xing_worker 角色（BYPASSRLS），老数据卷需要
+./dev.sh worker       # 启动（profile: worker，默认不跑）
+./dev.sh workerlog    # 跟踪日志
+```
+
+领取用 `FOR UPDATE SKIP LOCKED` + 90 秒租约：多 worker 不会抢到同一行，worker 崩溃后
+租约自动过期回收，不需要任何分布式锁。状态迁移的合法性由数据库函数
+`app.guard_task_status_transition` 守卫，服务层一处 `if` 都没有。
+
+租约还带**代次**（`tasks.lease_generation`）：领取与回收各 +1，所有状态写入都带
+`WHERE lease_generation = :gen`。这挡住的是「A 卡住 → 租约过期 → B 接管 → A 恢复后
+把自己的结果覆盖上去」——身份（`locked_by`）挡不住这种情况，因为容器重启后
+hostname:pid 往往完全相同。失效代次的写入是 0 行，worker 据此丢弃结果。
+
+任务的**初始状态由数据库决定**：无未满足依赖 → 创建即 `READY`；有依赖 → `PENDING`，
+等上游完成。两条路径共用 `app.dependencies_satisfied`，所以在「上游早已完成之后才创建下游」
+这种顺序下也不会卡死。
+
+worker 用独立的 `xing_worker` 连接：它的领取查询必须**跨租户**，与 API 的 NOBYPASSRLS
+方向相反。两个进程的 entrypoint 会各自校验自己那一侧，连错角色直接拒绝启动。
+
+### Agent 运行时
+
+`src/xing/agents/` 四个文件，边界很硬：
+
+| 文件 | 职责 | 不做什么 |
+| --- | --- | --- |
+| `pricing.py` | 模型单价 + **预留上界**（字符数当输入上界，`max_output_tokens` 当输出上界） | 不猜价格，未知模型直接报错 |
+| `provider.py` | `complete()` 一个方法；`stub`（确定性）/ `openai` | 不做工具调用、不做重试 |
+| `runtime.py` | step 循环、预算预留、调用录制、回放 | 不含任何业务语义 |
+| `writer.py` | 第一个真实 Agent：任务 → `contents` + v1 | 不写 `tasks.status` |
+
+```bash
+# 造一个 write_content 任务，worker 会产出草稿并记账
+docker compose exec db psql -U xing -d xing -c \
+  "INSERT INTO tasks (workspace_id, task_type, input)
+   SELECT id, 'write_content', '{\"brief\":\"写一段关于取舍的话\"}'::jsonb
+     FROM workspaces LIMIT 1;"
+```
+
+两条硬规矩：
+
+1. **LLM 调用在事务之外。** 预留 / 调用 / 结算各用一个短事务，调用期间不持连接。
+   否则一次 30 秒的调用会同时阻塞租约回收、占满连接池、废掉 `SKIP LOCKED`。
+2. **钱先占后花。** `reserved_cost` 是先预留的额度，预留额是真实花费的上界，
+   所以结算永远不会撞 `CHECK`。若靠「先花钱再记账」，越界时会把 `llm_calls`
+   明细一起回滚 —— 供应商收了钱，库里查无此账。
 
 ### 验证
 
 ```bash
-./dev.sh dbsmoke     # 全链路插入 + 约束/触发器断言 + P0 回归，自动回滚
+./dev.sh dbsmoke     # 全链路插入 + 约束/触发器断言 + P0/Agent 契约，自动回滚
 ./dev.sh rlscheck    # 以 xing_app 角色验证租户隔离，自动回滚
-./dev.sh test        # pytest，含 RLS 上下文注入回归
+./dev.sh test        # pytest，含 RLS 上下文注入与 worker 并发回归
 ```
 
 ### RLS 是怎么真正生效的
 
-16 张业务表开了 RLS，但 RLS 对**超级用户和表 owner 一律不生效** —— 「开了」不等于「生效」。三层保证缺一不可：
+17 张业务表开了 RLS，但 RLS 对**超级用户和表 owner 一律不生效** —— 「开了」不等于「生效」。三层保证缺一不可：
 
 **1. 连接身份。** `DATABASE_URL` 指向 `xing_app`（NOSUPERUSER / NOBYPASSRLS / 非表 owner），`DATABASE_ADMIN_URL` 只在迁移时使用。新建数据卷时 `docker/postgres/init/02-app-role.sql` 自动建角色；已有数据卷执行 `./dev.sh approle`。
 

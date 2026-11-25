@@ -42,6 +42,23 @@ class ApiError(Exception):
         self.details = details or {}
 
 
+class NonRetryableError(Exception):
+    """确定性的失败：重试不会改变结果。
+
+    worker 的重试逻辑默认对所有异常一视同仁，但预算耗尽、输入非法这类错误
+    重试一万次也是同一个结局 —— 只会烧钱、堵队列，并让真正的失败原因淹没在
+    重试记录里。抛本类（或它的子类）直接进 FAILED，不进 RETRYING。
+    """
+
+    #: 落库到 tasks.error.code / agent_runs.error.code 的稳定标识
+    code: str = "NON_RETRYABLE"
+
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message or self.code)
+        if code is not None:
+            self.code = code
+
+
 def problem_response(
     *,
     status_code: int,

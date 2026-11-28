@@ -27,7 +27,9 @@ from xing.models.decision import Decision, DecisionStatus, DecisionTrace, Decisi
 from xing.models.event import ExternalEvent
 from xing.models.strategy import Strategy, StrategyStatus
 from xing.models.topic import Topic, TopicStatus
+from xing.schemas.task import TaskCreate
 from xing.schemas.topic import TopicOut, TopicRecommendation
+from xing.services.task_service import create_task
 
 # 时效性权重：社交平台上的东西半衰期更短，权重给高
 _SOURCE_WEIGHT = {
@@ -330,6 +332,7 @@ async def select_topic(
 ) -> tuple[TopicOut, UUID]:
     topic = await _lock_selectable_topic(session, workspace_id, topic_id)
     version_id = await _resolve_strategy_version(session, workspace_id)
+    _require_opinion(topic)
 
     topic.status = TopicStatus.SELECTED
     topic.selected_at = func.now()
@@ -368,6 +371,28 @@ async def select_topic(
     )
     await session.commit()
 
+    # 选定之后链条自己往下走：排一个深入任务（检索 → 证据 → 完整 brief →
+    # 写 + 审）。dedup_key 建在 topic 上，所以重复点「选定」、或者这次请求
+    # 在响应阶段失败后重试，都不会长出第二条生产线。
+    #
+    # 放在 commit 之后而不是同一事务里，是因为 ``create_task`` 自己会提交
+    # （它要拿触发器推进后的 status）。代价是「选定成功但排产失败」这个极窄
+    # 的窗口 —— 此时再点一次选定会报 TOPIC_NOT_SELECTABLE。
+    # 补偿路径在链路状态里：``get_status`` 过了空窗仍看不到 deepen 任务，会把
+    # 那一步标成 FAILED（``DEEPEN_NOT_ENQUEUED``）并允许重跑，重跑即补排。
+    # 相比让决策记录与任务创建共享一个事务、却因为嵌套提交而半途失效，
+    # 这个代价更小也更容易解释。
+    await create_task(
+        session,
+        workspace_id=workspace_id,
+        payload=TaskCreate(
+            task_type="deepen_topic",
+            input={"topic_id": str(topic_id), "actor_id": str(user_id)},
+            assigned_agent="deepener",
+            dedup_key=f"{topic_id}:deepen",
+        ),
+    )
+
     return (
         await get_topic(session, workspace_id=workspace_id, topic_id=topic_id),
         decision.id,
@@ -402,6 +427,32 @@ async def reject_topic(
     await session.commit()
 
     return await get_topic(session, workspace_id=workspace_id, topic_id=topic_id)
+
+
+def _require_opinion(topic: Topic) -> None:
+    """选定前必须已经过舆论检测。
+
+    这是这条链唯一的「人 + 机器」双重闸门：检测任务和选定是两个独立请求，
+    中间有 8~15 秒的窗口。过去在这个窗口里点选定，``check_opinion`` 只捞
+    ``CANDIDATE/RECOMMENDED``，已 ``SELECTED`` 的题会被静默排除 ——
+    闸门被绕过，决策却写下来了。所以拒绝放在这里，而不是只靠界面禁用按钮。
+
+    兼容旧数据：没有 ``brief.opinion`` 的选题一律视为「未检测」，
+    需要重跑一次展开（``expand_topics`` 幂等，会补上检测任务）。
+    """
+    opinion = (topic.brief or {}).get("opinion") or {}
+    if not isinstance(opinion, dict) or not opinion.get("checked"):
+        raise ApiError(
+            409,
+            "OPINION_PENDING",
+            "舆论检测还没完成，请等这一步结束再选定",
+        )
+    if opinion.get("verdict") not in ("GROUNDED", "WEAK"):
+        raise ApiError(
+            409,
+            "OPINION_UNGROUNDED",
+            "这个切面没有通过舆论检测，不能选定",
+        )
 
 
 async def _lock_selectable_topic(

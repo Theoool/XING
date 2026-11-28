@@ -62,4 +62,21 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 ALTER DEFAULT PRIVILEGES IN SCHEMA app
     GRANT EXECUTE ON FUNCTIONS TO xing_app;
 
+-- 上面那条 ALL TABLES 是按「所有表都要能改」写的，但对**只增不改**的表
+-- 它恰好把约束抹掉了。这个脚本是手动 bootstrap、可重复运行的，而迁移是
+-- 另一个时机跑的：只要先跑过迁移再跑本脚本（开发环境里很常见），
+-- 0012 里的 REVOKE 就会被这里的 GRANT 无声覆盖 —— append-only 退化成注释。
+-- 所以在这里再收一次，让「谁都不能改轨迹」不依赖两个脚本的先后顺序。
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'retrieval_traces'
+    ) THEN
+        REVOKE UPDATE, DELETE, TRUNCATE ON retrieval_traces FROM xing_app;
+        RAISE NOTICE 'retrieval_traces: append-only 已强制（去掉 UPDATE/DELETE）';
+    END IF;
+END
+$$;
+
 \echo 'app role ready'

@@ -75,9 +75,7 @@ async def workspace():
 
 async def _run(run_id: UUID) -> AgentRun:
     async with WorkerSession() as session:
-        return (
-            await session.execute(select(AgentRun).where(AgentRun.id == run_id))
-        ).scalar_one()
+        return (await session.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one()
 
 
 async def _calls(run_id: UUID) -> list[LlmCall]:
@@ -85,9 +83,7 @@ async def _calls(run_id: UUID) -> list[LlmCall]:
         return list(
             (
                 await session.execute(
-                    select(LlmCall)
-                    .where(LlmCall.run_id == run_id)
-                    .order_by(LlmCall.call_seq)
+                    select(LlmCall).where(LlmCall.run_id == run_id).order_by(LlmCall.call_seq)
                 )
             )
             .scalars()
@@ -116,16 +112,12 @@ async def test_reservation_blocks_overspend_before_calling(workspace):
     ws, _ = workspace
     # 上限设得比任何一次调用的预留还小：预留阶段就该被拒
     run_id = await runtime.start_run(
-        runtime.RunSpec(
-            workspace_id=ws, agent_name="t", goal="poor", max_cost=Decimal("0.0001")
-        )
+        runtime.RunSpec(workspace_id=ws, agent_name="t", goal="poor", max_cost=Decimal("0.0001"))
     )
     step = await runtime.begin_step(run_id)
 
     with pytest.raises(runtime.BudgetExceeded):
-        await runtime.call_model(
-            run_id, purpose="generate", step_no=step, prompt="x" * 400
-        )
+        await runtime.call_model(run_id, purpose="generate", step_no=step, prompt="x" * 400)
 
     assert await _calls(run_id) == []
     assert await runtime.fail_run(run_id, code="BUDGET_EXCEEDED", message="too poor")
@@ -170,9 +162,7 @@ async def test_replay_returns_recorded_response_without_cost(workspace):
     ws, _ = workspace
     prompt = "同一个请求应该只花一次钱"
 
-    first = await runtime.start_run(
-        runtime.RunSpec(workspace_id=ws, agent_name="t", goal="first")
-    )
+    first = await runtime.start_run(runtime.RunSpec(workspace_id=ws, agent_name="t", goal="first"))
     step = await runtime.begin_step(first)
     original = await runtime.call_model(
         first, purpose="generate", step_no=step, prompt=prompt, provider=StubProvider()

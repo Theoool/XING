@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -19,6 +20,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from xing.agents import reviewer, schemas, writer
 from xing.core.config import settings
 from xing.db.worker import WorkerSession
 from xing.db.worker import dispose as dispose_worker
@@ -157,11 +159,7 @@ async def test_write_content_leaves_a_complete_audit_trail(workspace):
 
     async with WorkerSession() as session:
         calls = list(
-            (
-                await session.execute(select(LlmCall).where(LlmCall.run_id == run.id))
-            )
-            .scalars()
-            .all()
+            (await session.execute(select(LlmCall).where(LlmCall.run_id == run.id))).scalars().all()
         )
     assert len(calls) == 1
     assert calls[0].purpose == "generate"
@@ -220,3 +218,91 @@ async def test_rerun_of_same_task_reuses_the_draft(workspace):
 
     runs = await _runs(task_id)
     assert len(runs) == 1, "幂等命中不应再开一次 run（那会重复计费）"
+
+
+def test_length_guide_follows_content_type():
+    """篇幅档按类型走，不再是一刀切的 1600 tokens。
+
+    默认写成文章：这个 Agent 的 prompt 就是公众号写作。之前的默认值是
+    VIDEO_SCRIPT，于是文章按口播稿的体量写，成稿普遍 700~1100 字。
+    """
+
+    assert writer.length_guide("ARTICLE").floor == 1400
+    assert writer.length_guide("VIDEO_SCRIPT").floor < writer.length_guide("ARTICLE").floor
+    # 未知类型走中性档，不按文章标准硬套
+    assert writer.length_guide("SOMETHING_NEW").floor == writer._FALLBACK_GUIDE.floor
+
+    plain = SimpleNamespace(input={})
+    assert writer._max_output_tokens(plain, "ARTICLE") == 4000
+    assert writer._max_output_tokens(plain, "VIDEO_SCRIPT") == 1800
+    # 显式要求仍然最优先：档位是默认值，不是硬规则
+    explicit = SimpleNamespace(input={"max_output_tokens": 900})
+    assert writer._max_output_tokens(explicit, "ARTICLE") == 900
+
+
+def test_reviewer_length_gate_catches_short_body():
+    """篇幅机检：字数算得出来，不该交给 judge 估。
+
+    低于下限 80% 直接 FAIL（没写完），介于 80%~下限之间只记 issue 扣分
+    （收尾仓促，补一句就能交）—— 两者的返工方式不同。
+    """
+    short = reviewer.Snapshot(
+        id=uuid4(),
+        title="短稿",
+        content_type="ARTICLE",
+        status="DRAFT",
+        body="只有一句话。" * 100,  # 600 字，远低于 1400
+        meta={"length_floor": 1400},
+    )
+    verdict = reviewer._length_gate(
+        schemas.ReviewVerdict(verdict="PASS", score=88, issues=[]), short
+    )
+    assert verdict.verdict == "FAIL"
+    assert verdict.score == 0
+    assert any("篇幅不足" in item for item in verdict.issues)
+
+    # 差一点：只扣分，不判死
+    almost = reviewer.Snapshot(
+        id=uuid4(),
+        title="差一点",
+        content_type="ARTICLE",
+        status="DRAFT",
+        body="字" * 1300,
+        meta={"length_floor": 1400},
+    )
+    verdict = reviewer._length_gate(
+        schemas.ReviewVerdict(verdict="PASS", score=88, issues=[]), almost
+    )
+    assert verdict.verdict == "PASS"
+    assert verdict.score == 73
+    assert len(verdict.issues) == 1
+
+    # 达标：原样返回，不追加 issue
+    ok = reviewer.Snapshot(
+        id=uuid4(),
+        title="够长",
+        content_type="ARTICLE",
+        status="DRAFT",
+        body="字" * 1500,
+        meta={"length_floor": 1400},
+    )
+    verdict = reviewer._length_gate(schemas.ReviewVerdict(verdict="PASS", score=88, issues=[]), ok)
+    assert verdict.verdict == "PASS"
+    assert verdict.score == 88
+    assert verdict.issues == []
+
+    # 老稿没有 metadata：退回按类型默认档，不因为缺字段就放行
+    legacy = reviewer.Snapshot(
+        id=uuid4(),
+        title="老稿",
+        content_type="ARTICLE",
+        status="DRAFT",
+        body="字" * 300,
+        meta={},
+    )
+    assert (
+        reviewer._length_gate(
+            schemas.ReviewVerdict(verdict="PASS", score=80, issues=[]), legacy
+        ).verdict
+        == "FAIL"
+    )

@@ -19,6 +19,7 @@ import json
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Protocol
+from uuid import UUID
 
 from xing.core.config import settings
 
@@ -32,6 +33,14 @@ class LlmResponse:
     #: 落库用。不含思维链，也不含任何凭据。
     request: dict[str, Any] = field(default_factory=dict)
     response: dict[str, Any] = field(default_factory=dict)
+    #: 这次响应挂在哪个回放键上。由 Runtime 填，provider 不关心。
+    #: 有了它，上层才能在「文本解析不过」时把这条输出从回放缓存里摘掉 ——
+    #: 否则同一段坏文本会被重试原样复读，错误位置每次都一样。
+    replay_key: str | None = None
+    workspace_id: UUID | None = None
+    #: 这条文本是从回放缓存复读的，不是这次真的问过模型。
+    #: 结构化输出要据此区分「模型又错了」和「我们在放录音」。
+    replayed: bool = False
 
 
 class LlmProvider(Protocol):
@@ -45,6 +54,9 @@ class LlmProvider(Protocol):
         prompt: str,
         max_output_tokens: int,
         shape: dict[str, Any] | None = None,
+        web_search: bool = False,
+        temperature: float | None = None,
+        json_object: bool = False,
     ) -> LlmResponse: ...
 
 
@@ -59,7 +71,9 @@ def fill(shape: Any) -> Any:
             return shape[5:].split("|")[0]
         return {"str": "stub", "int": 1, "float": 0.5, "bool": True}[shape]
     if isinstance(shape, list):
-        return [fill(shape[0])] if shape else []
+        # 固定 3 个元素。带 ``min_length=3`` 的列表契约（选题候选）需要一个
+        # 能通过校验的 stub 响应；只给 1 个会让契约测试假红。
+        return [fill(shape[0]) for _ in range(3)] if shape else []
     return {key: fill(value) for key, value in shape.items()}
 
 
@@ -82,6 +96,9 @@ class StubProvider:
         prompt: str,
         max_output_tokens: int,
         shape: dict[str, Any] | None = None,
+        web_search: bool = False,
+        temperature: float | None = None,
+        json_object: bool = False,
     ) -> LlmResponse:
         if shape is not None:
             body = json.dumps(fill(shape), ensure_ascii=False)
@@ -96,7 +113,12 @@ class StubProvider:
             input_tokens=len(system) + len(prompt),
             output_tokens=len(body),
             model=model,
-            request={"system": system, "prompt": prompt, "max_output_tokens": max_output_tokens},
+            request={
+                "system": system,
+                "prompt": prompt,
+                "max_output_tokens": max_output_tokens,
+                "web_search": web_search,
+            },
             response={"text": body, "finish_reason": "stop", "stub": True},
         )
 
@@ -123,9 +145,7 @@ class OpenAIProvider:
 
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
         # None 表示完全不发这个字段：它是 qwen 系私有参数，发给 OpenAI 会 400。
-        self._extra_body = (
-            {} if enable_thinking is None else {"enable_thinking": enable_thinking}
-        )
+        self._extra_body = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
 
     async def complete(
         self,
@@ -135,19 +155,42 @@ class OpenAIProvider:
         prompt: str,
         max_output_tokens: int,
         shape: dict[str, Any] | None = None,
+        web_search: bool = False,
+        temperature: float | None = None,
+        json_object: bool = False,
     ) -> LlmResponse:
         # shape 只对 stub 有意义：真实模型靠 system 里的输出指令，
         # 把结构描述塞进 prompt 只会多花 token。
-        resp = await self._client.chat.completions.create(
-            model=model,
-            messages=[
+        extra = dict(self._extra_body)
+        if web_search:
+            # 阿里云百炼 / DashScope 的联网检索开关。别的服务商不认这个字段，
+            # 所以只有检索 Agent 显式要求时才发 —— 默认一条都不发。
+            extra["enable_search"] = True
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=max_output_tokens,
-            temperature=0.7,
-            extra_body=self._extra_body or None,
-        )
+            "max_tokens": max_output_tokens,
+            "temperature": 0.7 if temperature is None else temperature,
+            "extra_body": extra or None,
+        }
+        if json_object:
+            # 让「合法 JSON」由解码保证，而不是靠 prompt 求模型守规矩。
+            # 这条路走通之后，漏引号/把数组写成键值对这类坏法在生成阶段就不存在了。
+            payload["response_format"] = {"type": "json_object"}
+
+        try:
+            resp = await self._client.chat.completions.create(**payload)
+        except Exception as exc:
+            # 兼容网关未必认 response_format，有的直接 400。退了这一步还能靠
+            # prompt 与 ``runtime._quote_bare_values`` 兜住；不退就是整条链挂掉。
+            if not json_object or "response_format" not in str(exc).lower():
+                raise
+            payload.pop("response_format", None)
+            resp = await self._client.chat.completions.create(**payload)
         choice = resp.choices[0]
         text = choice.message.content or ""
         usage = resp.usage
@@ -159,7 +202,14 @@ class OpenAIProvider:
             input_tokens=usage.prompt_tokens,
             output_tokens=usage.completion_tokens,
             model=model,
-            request={"system": system, "prompt": prompt, "max_output_tokens": max_output_tokens},
+            request={
+                "system": system,
+                "prompt": prompt,
+                "max_output_tokens": max_output_tokens,
+                "web_search": web_search,
+                "temperature": payload["temperature"],
+                "json_object": json_object,
+            },
             response={"text": text, "finish_reason": choice.finish_reason},
         )
 

@@ -60,7 +60,23 @@ GRANT SELECT                           ON workspaces         TO xing_worker;
 GRANT SELECT                           ON workspace_members  TO xing_worker;
 GRANT SELECT                           ON strategies         TO xing_worker;
 GRANT SELECT                           ON strategy_versions  TO xing_worker;
-GRANT SELECT                           ON topics             TO xing_worker;
+-- 选题需要写，不只是读：
+--   expander 产出候选（INSERT CANDIDATE），scorer 回填四个分数并把前三个
+--   标成 RECOMMENDED（UPDATE）。但没有 DELETE —— 选题只被 REJECTED/EXPIRED，
+--   不删除，删了「这个题当年被否掉过」这条信息就没了。
+GRANT SELECT, INSERT, UPDATE           ON topics             TO xing_worker;
+-- 证据关系：深入阶段要把「哪条材料支撑哪个论点、原文是哪一句」写进来。
+-- 仍然没有 DELETE —— 证据只增不删：一次深入用过的材料是审计的一部分，
+-- 删掉之后「当时凭什么这么写」就答不出来了。重跑靠 (topic_id, event_id)
+-- 主键做 upsert，不会因为不给 DELETE 而堆积重复行。
+GRANT SELECT, INSERT, UPDATE           ON topic_events       TO xing_worker;
+-- 舆论立场：展开阶段写。同样没有 DELETE —— 一次展开采集到哪些声音，
+-- 是「这个切面凭什么成立」的原始依据，删掉就再也回答不了。
+GRANT SELECT, INSERT, UPDATE           ON opinion_stances    TO xing_worker;
+-- 候选 → 立场：有引用才有候选。只有 INSERT 与 SELECT，没有 UPDATE：
+-- 引用关系是对「这个题建立在什么之上」的断言，改它等于改写历史，
+-- 需要改就重新展开一批。
+GRANT SELECT, INSERT                   ON topic_stances      TO xing_worker;
 -- 审批：只能「举手」，不能「决定」。
 --
 -- Reviewer 执行完要留下一条 PENDING，否则「这篇内容在等谁」在库里没有表示，

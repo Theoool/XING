@@ -76,7 +76,5 @@ def reserve_upper_bound(model: str, prompt_chars: int, max_output_tokens: int | 
     """
     p = price_of(model)
     out = max_output_tokens or p.max_output_tokens
-    raw = (
-        Decimal(prompt_chars) * p.input_per_1k + Decimal(out) * p.output_per_1k
-    ) / Decimal(1000)
+    raw = (Decimal(prompt_chars) * p.input_per_1k + Decimal(out) * p.output_per_1k) / Decimal(1000)
     return raw.quantize(QUANT, rounding=ROUND_CEILING)

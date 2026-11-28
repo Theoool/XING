@@ -4,7 +4,7 @@ COMPOSE := docker compose
 
 .PHONY: help up build down stop restart logs logs-all ps sh db redis \
         migrate approle dbsmoke rlscheck ormcheck revision downgrade test lint fmt typecheck \
-        tools health reset
+        tools health reset web web-install web-build
 
 help: ## 显示所有可用命令
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -96,3 +96,12 @@ reset: ## 清空数据库与缓存（危险，需输入 yes 确认）
 	@read -r -p "输入 yes 继续: " ans; [ "$$ans" = "yes" ] || { echo "已取消"; exit 1; }
 	$(COMPOSE) down -v
 	@echo "已清空。下次 make up 会重新初始化。"
+
+web-install: ## 安装前端依赖
+	cd web && npm install
+
+web: ## 启动前端开发服务器（http://localhost:5173）
+	cd web && npm run dev
+
+web-build: ## 构建前端（先跑类型检查）
+	cd web && npm run build

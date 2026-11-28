@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from xing.api.deps import CurrentUserId, WorkspaceDb
 from xing.schemas.strategy import (
     StrategyCreate,
     StrategyOut,
+    StrategyUpdate,
     StrategyVersionCreate,
+    StrategyVersionListOut,
 )
 from xing.services import strategy_service
 
@@ -45,6 +48,33 @@ async def get_active_strategy(workspace_id: UUID, session: WorkspaceDb) -> Strat
 async def get_strategy(workspace_id: UUID, strategy_id: UUID, session: WorkspaceDb) -> StrategyOut:
     return await strategy_service.get_strategy(
         session, workspace_id=workspace_id, strategy_id=strategy_id
+    )
+
+
+@router.patch("/strategies/{strategy_id}", response_model=StrategyOut, summary="重命名战略")
+async def rename_strategy(
+    workspace_id: UUID, strategy_id: UUID, payload: StrategyUpdate, session: WorkspaceDb
+) -> StrategyOut:
+    """只改名字。配置必须走「新增版本」，否则历史版本会指向被改过的内容。"""
+    return await strategy_service.rename_strategy(
+        session, workspace_id=workspace_id, strategy_id=strategy_id, name=payload.name
+    )
+
+
+@router.get(
+    "/strategies/{strategy_id}/versions",
+    response_model=list[StrategyVersionListOut],
+    summary="战略版本历史",
+)
+async def list_strategy_versions(
+    workspace_id: UUID,
+    strategy_id: UUID,
+    session: WorkspaceDb,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> list[StrategyVersionListOut]:
+    """只读。战略版本不可修改，要「回滚」只能把旧配置复制成新版本。"""
+    return await strategy_service.list_versions(
+        session, workspace_id=workspace_id, strategy_id=strategy_id, limit=limit
     )
 
 

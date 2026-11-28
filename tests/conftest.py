@@ -1,8 +1,20 @@
 """pytest 全局夹具。"""
 
-import pytest
+import os
 
-from xing.db.session import dispose_engine
+# 测试永远跑 stub，与开发者本地的 .env 无关。
+#
+# 之前这两件事是耦合的：把 .env 切成真实模型好让界面能用，测试就会跟着
+# 变成「真的调模型、真的花钱、还不可复现」。强制在导入应用之前改写环境变量，
+# 让「界面连真模型」和「测试离线可复现」同时成立。
+# 必须在 import xing.* 之前执行 —— settings 是模块级单例，导入即固化。
+os.environ["LLM_PROVIDER"] = "stub"
+os.environ["LLM_MODEL"] = "stub-1"
+os.environ["SEARCH_PROVIDER"] = "stub"
+
+import pytest  # noqa: E402
+
+from xing.db.session import dispose_engine  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

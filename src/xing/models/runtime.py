@@ -82,9 +82,7 @@ class AgentRun(Base):
     agent_name: Mapped[str] = mapped_column(Text, nullable=False)
     #: 同一 task 的第几次执行（= tasks.retry_count + 1）。**run 级**，
     #: 与调用次数无关 —— 调用级的序号是 LlmCall.call_seq。
-    attempt: Mapped[int] = mapped_column(
-        SmallInteger, nullable=False, server_default=text("1")
-    )
+    attempt: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
 
     goal: Mapped[str] = mapped_column(Text, nullable=False)
     plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -105,9 +103,7 @@ class AgentRun(Base):
     max_tokens: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("200000")
     )
-    total_tokens: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, server_default=text("0")
-    )
+    total_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     max_cost: Mapped[Decimal] = mapped_column(
         Numeric(18, 8), nullable=False, server_default=text("2.0")
     )
@@ -144,11 +140,7 @@ class AgentRun(Base):
         # 复合外键的被引用侧。只为满足「被引用列组必须唯一」这条语法要求，
         # 但它把「run 属于哪个租户」变成了可被 llm_calls 引用的既有事实。
         UniqueConstraint("id", "workspace_id", name="agent_runs_id_workspace_key"),
-        {
-            "comment": (
-                "One agent execution: goal, plan, autonomy mode, three-layer budget."
-            )
-        },
+        {"comment": ("One agent execution: goal, plan, autonomy mode, three-layer budget.")},
     )
 
     def __repr__(self) -> str:
@@ -238,11 +230,7 @@ class LlmCall(Base):
             "model_name",
             text("started_at DESC"),
         ),
-        {
-            "comment": (
-                "One model call. Detail source of cost; agent_runs.total_* rolls it up."
-            )
-        },
+        {"comment": ("One model call. Detail source of cost; agent_runs.total_* rolls it up.")},
     )
 
     def __repr__(self) -> str:
@@ -292,5 +280,6 @@ class LlmPurpose:
     PLAN = "plan"
     TOOL_DECISION = "tool_decision"
     GENERATE = "generate"
+    ANALYZE = "analyze"
     SELF_CHECK = "self_check"
     REPAIR = "repair"

@@ -74,9 +74,7 @@ async def workspace_id():
     yield ws_id
 
     async with admin.begin() as conn:
-        await conn.execute(
-            text("delete from workspaces where id = :id"), {"id": ws_id}
-        )
+        await conn.execute(text("delete from workspaces where id = :id"), {"id": ws_id})
     await admin.dispose()
 
 
@@ -119,7 +117,7 @@ async def test_claim_marks_running_with_lease(workspace_id):
     task_id = await _add_task(workspace_id)
 
     async with WorkerSession() as session:
-        claimed = await queue.claim_one(session, worker_id="w1")
+        claimed = await queue.claim_one(session, worker_id="w1", workspace_id=workspace_id)
         await session.commit()
         assert claimed is not None
         assert claimed.id == task_id
@@ -132,7 +130,7 @@ async def test_claim_marks_running_with_lease(workspace_id):
 
     # 已不是 READY，不能再被领
     async with WorkerSession() as session:
-        assert await queue.claim_one(session, worker_id="w2") is None
+        assert await queue.claim_one(session, worker_id="w2", workspace_id=workspace_id) is None
 
 
 async def test_concurrent_workers_execute_each_task_once(workspace_id, monkeypatch):
@@ -150,7 +148,9 @@ async def test_concurrent_workers_execute_each_task_once(workspace_id, monkeypat
 
     async def consume(name: str) -> int:
         handled = 0
-        while (await runner.claim_and_run(worker_id=name)) is not None:
+        # 钉住本文件的租户：其他测试文件留下的 READY 任务也在同一个池子里，
+        # 不收紧的话这里会替别人跑任务，`set(calls) == ids` 随执行顺序变红。
+        while (await runner.claim_and_run(worker_id=name, workspace_id=workspace_id)) is not None:
             handled += 1
         return handled
 
@@ -171,11 +171,9 @@ async def test_concurrent_workers_execute_each_task_once(workspace_id, monkeypat
 
 async def test_failure_moves_to_retrying_then_failed(workspace_id):
     # 额度 1：第一次失败进 RETRYING，第二次耗尽进 FAILED
-    task_id = await _add_task(
-        workspace_id, payload={"fail_with": "boom"}, max_retries=1
-    )
+    task_id = await _add_task(workspace_id, payload={"fail_with": "boom"}, max_retries=1)
 
-    first = await runner.claim_and_run(worker_id="w1")
+    first = await runner.claim_and_run(worker_id="w1", workspace_id=workspace_id)
     assert first is not None and first.status == "RETRYING"
     task = await _get(task_id)
     assert task is not None
@@ -192,7 +190,7 @@ async def test_failure_moves_to_retrying_then_failed(workspace_id):
         await session.commit()
         assert await queue.promote_retrying(session) >= 1
 
-    second = await runner.claim_and_run(worker_id="w1")
+    second = await runner.claim_and_run(worker_id="w1", workspace_id=workspace_id)
     assert second is not None and second.status == "FAILED"
     task = await _get(task_id)
     assert task is not None
@@ -204,7 +202,7 @@ async def test_failure_moves_to_retrying_then_failed(workspace_id):
 async def test_no_handler_fails_fast(workspace_id):
     task_id = await _add_task(workspace_id, task_type="not-registered")
 
-    outcome = await runner.claim_and_run(worker_id="w1")
+    outcome = await runner.claim_and_run(worker_id="w1", workspace_id=workspace_id)
     assert outcome is not None and outcome.status == "FAILED"
 
     task = await _get(task_id)
@@ -214,6 +212,13 @@ async def test_no_handler_fails_fast(workspace_id):
 
 
 async def test_reclaim_expired_lease(workspace_id):
+    """租约过期且还有额度 → 回 RETRYING。
+
+    这里**不**断言全局计数等于 1：``reclaim_expired`` 是全队列扫的运维函数
+    （生产上就该一次扫全库），开发库里随时可能有别的遗留任务一起被回收，
+    断言绝对值等于让测试结果依赖「库里现在有什么」。真正被测的是
+    「这一行去哪了」，所以按行断言，计数只用来确认函数返回值接通了。
+    """
     expired = datetime.now(UTC) - timedelta(seconds=5)
     task_id = await _add_task(
         workspace_id,
@@ -225,8 +230,8 @@ async def test_reclaim_expired_lease(workspace_id):
     )
 
     async with WorkerSession() as session:
-        to_retry, to_failed = await queue.reclaim_expired(session)
-    assert (to_retry, to_failed) == (1, 0)
+        to_retry, _ = await queue.reclaim_expired(session)
+    assert to_retry >= 1
 
     task = await _get(task_id)
     assert task is not None
@@ -237,6 +242,7 @@ async def test_reclaim_expired_lease(workspace_id):
 
 
 async def test_reclaim_without_retry_budget_fails(workspace_id):
+    """额度耗尽 → 直接终态，不再回队列。同理只断言行，不断言全队列计数。"""
     expired = datetime.now(UTC) - timedelta(seconds=5)
     task_id = await _add_task(
         workspace_id,
@@ -249,12 +255,15 @@ async def test_reclaim_without_retry_budget_fails(workspace_id):
     )
 
     async with WorkerSession() as session:
-        to_retry, to_failed = await queue.reclaim_expired(session)
-    assert (to_retry, to_failed) == (0, 1)
+        _, to_failed = await queue.reclaim_expired(session)
+    assert to_failed >= 1
 
     task = await _get(task_id)
     assert task is not None
     assert task.status == TaskStatus.FAILED
+    # 额度耗尽必须保留原 retry_count：+1 会被 tasks_retry_within_limit 挡住，
+    # 若这里变成 3 说明分流判断挪到了应用层。
+    assert task.retry_count == 2
 
 
 async def test_illegal_transition_is_rejected_by_database(workspace_id):
@@ -284,7 +293,7 @@ async def test_stale_generation_write_is_fenced_out(workspace_id):
 
     # 1. A 领取 → generation = 1
     async with WorkerSession() as session:
-        claimed = await queue.claim_one(session, worker_id="worker-A")
+        claimed = await queue.claim_one(session, worker_id="worker-A", workspace_id=workspace_id)
         await session.commit()
         assert claimed is not None and claimed.id == task_id
         gen_a = claimed.lease_generation
@@ -309,7 +318,7 @@ async def test_stale_generation_write_is_fenced_out(workspace_id):
         await session.commit()
         await queue.promote_retrying(session)
     async with WorkerSession() as session:
-        claimed = await queue.claim_one(session, worker_id="worker-B")
+        claimed = await queue.claim_one(session, worker_id="worker-B", workspace_id=workspace_id)
         await session.commit()
         assert claimed is not None and claimed.id == task_id
         gen_b = claimed.lease_generation
@@ -373,7 +382,7 @@ async def test_created_task_waits_when_dependency_unmet(workspace_id):
 
     # 上游跑完，下游自动转 READY
     async with WorkerSession() as session:
-        claimed = await queue.claim_one(session, worker_id="w1")
+        claimed = await queue.claim_one(session, worker_id="w1", workspace_id=workspace_id)
         await session.commit()
         assert claimed is not None and claimed.id == upstream
     await runner.run_task(upstream, worker_id="w1")
@@ -389,7 +398,7 @@ async def test_created_task_is_ready_when_dependency_already_done(workspace_id):
     upstream = await _add_task(workspace_id)
 
     async with WorkerSession() as session:
-        claimed = await queue.claim_one(session, worker_id="w1")
+        claimed = await queue.claim_one(session, worker_id="w1", workspace_id=workspace_id)
         await session.commit()
         assert claimed is not None and claimed.id == upstream
     await runner.run_task(upstream, worker_id="w1")

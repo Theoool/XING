@@ -33,3 +33,27 @@ class TaskOut(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime
+
+
+class QueueStatus(BaseModel):
+    """队列的可观察面。
+
+    队列是拉模型，任务停在 ``READY`` 有两种截然不同的原因：队列前面有人排队，
+    或者根本没人来领。光看任务列表分不出这两者，所以把「有几个 worker 活着」
+    和「最早一条等了多久」放在一起给出来 —— ``stalled`` 就是它们的结论。
+    没有心跳时还挂在 ``RUNNING`` 的任务同理：执行者已经不在了，只是还没人收尸。
+    """
+
+    #: 存活 worker 数（Redis 心跳，30 秒过期）。0 表示没有进程在消费队列；
+    #: null 表示心跳读不到（Redis 不可用）—— 这时 `stalled` 不下结论。
+    workers_online: int | None
+    #: 已排产待领取 / 等待依赖的任务数。
+    queued: int
+    #: 正在执行的任务数。
+    running: int
+    #: 最早一条未被领取的任务等了多久（秒）。没有排队任务时为 null。
+    oldest_wait_s: int | None
+    #: 有人在排队或卡在执行中，却没有 worker 在跑 —— 这些任务不会自己往前走。
+    #: 排队的那批没人领；执行中的那批则是执行者已经死了，而租约回收也长在
+    #: worker 的主循环里，所以同样没人收尸。
+    stalled: bool

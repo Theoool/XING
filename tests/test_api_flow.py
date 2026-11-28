@@ -18,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from xing.cache import heartbeat
 from xing.core.config import settings
 from xing.main import app
 
@@ -124,6 +125,19 @@ async def test_business_chain(client: AsyncClient, workspace: dict) -> None:
     assert len(again.json()) == 1
 
     topic_id = topics[0]["id"]
+
+    # 选定前必须先过舆论检测。推荐链路不跑模型，这里直接把结论写进去 ——
+    # 闸门本身由 test_chain_status.py 覆盖，这里只需要一个已检测的选题。
+    admin = create_async_engine(settings.migration_database_url, poolclass=NullPool)
+    async with admin.begin() as conn:
+        await conn.execute(
+            text("update topics set brief = cast(:brief as jsonb) where id = :id"),
+            {
+                "brief": '{"opinion": {"checked": true, "verdict": "GROUNDED"}}',
+                "id": topic_id,
+            },
+        )
+    await admin.dispose()
 
     # --- 选定选题：应该自动写一条绑定「最新版本」的决策 -----------------
     selected = await client.post(
@@ -360,3 +374,43 @@ async def test_task_orm_keeps_rls_and_contract(client: AsyncClient, workspace: d
     # 仍然是 READY，说明上面那次 cancel 一个字段都没写到
     still = await client.get(f"{API}/workspaces/{workspace_id}/tasks/{task['id']}")
     assert still.json()["status"] == "READY"
+
+
+async def test_queue_status_endpoint(client: AsyncClient, workspace: dict, monkeypatch) -> None:
+    """队列状态是可诊断的：堆了多少 + 有没有人在消费，缺一个都解释不了「为什么不动」。"""
+    workspace_id = workspace["id"]
+
+    async def _no_workers() -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(heartbeat, "live", _no_workers)
+
+    response = await client.get(f"{API}/workspaces/{workspace_id}/queue/status")
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "workers_online": 0,
+        "queued": 0,
+        "running": 0,
+        "oldest_wait_s": None,
+        "stalled": False,
+    }
+
+    created = await client.post(
+        f"{API}/workspaces/{workspace_id}/tasks",
+        json={"task_type": "echo", "input": {"probe": 1}},
+    )
+    assert created.status_code == 201, created.text
+
+    response = await client.get(f"{API}/workspaces/{workspace_id}/queue/status")
+    body = response.json()
+    assert body["queued"] == 1
+    assert body["workers_online"] == 0
+    assert body["stalled"] is True, "有人在排队却没人领，必须报出来"
+    assert body["oldest_wait_s"] is not None
+
+    async def _one_worker() -> list[dict[str, object]]:
+        return [{"worker_id": "w-test", "agent": None, "beat": 0}]
+
+    monkeypatch.setattr(heartbeat, "live", _one_worker)
+    response = await client.get(f"{API}/workspaces/{workspace_id}/queue/status")
+    assert response.json()["stalled"] is False

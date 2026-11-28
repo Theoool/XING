@@ -48,6 +48,7 @@ from xing.models.runtime import (
 from xing.models.strategy import Strategy, StrategyStatus, StrategyVersion
 from xing.models.task import Task, TaskStatus
 from xing.models.topic import Topic, TopicEvent, TopicEventRole, TopicStatus
+from xing.models.trace import RetrievalTrace
 
 __all__ = [
     "AgeBucket",
@@ -77,6 +78,7 @@ __all__ = [
     "ProductionStatus",
     "Publication",
     "PublicationStatus",
+    "RetrievalTrace",
     "SourceType",
     "Strategy",
     "StrategyStatus",

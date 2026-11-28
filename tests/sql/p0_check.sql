@@ -142,6 +142,32 @@ BEGIN
         RAISE NOTICE 'ok: P0-5 邮箱大小写不敏感唯一';
     END;
 
+    -- ---------------------------------------------------------------
+    -- P0-6：检索轨迹只增不改
+    -- ---------------------------------------------------------------
+    -- 轨迹是取证数据：它记录的是「当时到底搜了什么、返回了什么」。
+    -- 一旦应用角色能改它，任何一段走漏的 UPDATE 都能把历史修饰成
+    -- 我们想看到的样子，而这些轨迹正是用来反驳我们自己的。
+    -- 注意这条不是测 RLS，是测**授权**：scripts/app_role.sql 里的
+    -- GRANT ... ON ALL TABLES 会把它重新打开，所以必须常驻检查。
+    DECLARE
+        v_privs text;
+    BEGIN
+        SELECT string_agg(DISTINCT privilege_type, ',' ORDER BY privilege_type)
+          INTO v_privs
+          FROM information_schema.role_table_grants
+         WHERE table_name = 'retrieval_traces'
+           AND grantee IN ('xing_app', 'xing_worker');
+
+        IF v_privs IS NULL THEN
+            RAISE NOTICE 'skip: 应用角色未创建，跳过 P0-6';
+        ELSIF v_privs ~ 'UPDATE|DELETE|TRUNCATE' THEN
+            RAISE EXCEPTION 'P0-6 回归：应用角色拿到 % —— 轨迹可被篡改', v_privs;
+        ELSE
+            RAISE NOTICE 'ok: P0-6 retrieval_traces 只增不改（%）', v_privs;
+        END IF;
+    END;
+
     RAISE NOTICE 'all P0 assertions passed';
 END
 $p0$;

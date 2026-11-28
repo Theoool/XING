@@ -22,6 +22,7 @@ from sqlalchemy import (
     Index,
     SmallInteger,
     Text,
+    UniqueConstraint,
     Uuid,
     desc,
     text,
@@ -116,6 +117,10 @@ class Task(Base):
     )
 
     __table_args__ = (
+        # 复合外键的被引用侧。任务只被 CANCELLED 不删除，所以这个唯一约束
+        # 除了满足「被引用列组必须唯一」之外没有别的用途 —— 但它让
+        # topics.seed_task_id 的复合外键成为可能，那才是跨租户的防线。
+        UniqueConstraint("id", "workspace_id", name="tasks_id_workspace_key"),
         Index("idx_tasks_workspace_status", "workspace_id", "status"),
         # 部分索引：领取时只扫 READY，索引体积与可领任务量同阶，
         # 不受历史任务堆积影响。排序键用 available_at 而非 created_at，

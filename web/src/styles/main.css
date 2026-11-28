@@ -1,0 +1,236 @@
+@import 'tailwindcss';
+
+/* ─── 设计令牌 ─────────────────────────────────────────────────────
+   编辑部气质：暖白纸面 + 墨黑侧栏 + 朱红强调。
+   不用纯黑纯白，长时间读稿不刺眼。 */
+@theme {
+  --font-sans:
+    'Inter', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-serif:
+    'Songti SC', 'Noto Serif SC', 'Source Han Serif SC', 'STSong', Georgia, serif;
+
+  --color-paper: #f5f3ee;
+  --color-paper-2: #fbfaf7;
+  --color-ink: #17130f;
+  --color-ink-2: #4a443c;
+  --color-muted: #8b8378;
+  --color-line: #e2ddd3;
+  --color-line-soft: #ece8df;
+
+  --color-accent: #bf4327;
+  --color-accent-soft: #fbeae4;
+
+  --color-ok: #2c6b4a;
+  --color-ok-soft: #e6f0ea;
+  --color-warn: #96661a;
+  --color-warn-soft: #f7eeda;
+  --color-bad: #9d2b22;
+  --color-bad-soft: #f8e7e4;
+
+  --radius-card: 10px;
+}
+
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-paper font-sans text-ink antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: #f0c9be;
+    color: #17130f;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  /* 细滚动条：内容区滚动时不要出现一条粗灰条 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #d3ccc0 transparent;
+  }
+}
+
+@layer components {
+  .eyebrow {
+    @apply text-[10.5px] font-medium tracking-[0.22em] text-muted uppercase;
+  }
+
+  .display {
+    @apply font-serif text-ink;
+    letter-spacing: -0.01em;
+  }
+
+  .surface {
+    @apply rounded-[var(--radius-card)] border border-line bg-paper-2;
+  }
+
+  .hairline {
+    @apply border-line-soft;
+  }
+
+  /* @apply 只能引用工具类：四个变体共用一条选择器列表写出基类，
+     避免「@apply btn」这种引用自定义类在 v4 下失效。 */
+  .btn,
+  .btn-primary,
+  .btn-accent,
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md px-3.5 py-2 text-[13px]
+      font-medium transition-colors duration-150 select-none disabled:pointer-events-none
+      disabled:opacity-40;
+  }
+
+  .btn-primary {
+    @apply bg-ink text-paper-2 hover:bg-[#2a231c] active:bg-[#0d0a08];
+  }
+
+  .btn-accent {
+    @apply bg-accent text-white hover:bg-[#a93920] active:bg-[#93311b];
+  }
+
+  .btn-ghost {
+    @apply border border-line bg-transparent text-ink-2 hover:border-[#cfc7ba]
+      hover:bg-[#efece4] hover:text-ink;
+  }
+
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-[12px];
+  }
+
+  .field {
+    @apply w-full rounded-md border border-line bg-white px-3 py-2.5 text-[14px] text-ink
+      placeholder:text-[#b0a89b] focus:border-[#c9bfae] focus:outline-none;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px]
+      font-medium whitespace-nowrap;
+  }
+
+  .link {
+    @apply text-accent underline decoration-[#e0b3a6] decoration-1 underline-offset-2
+      hover:decoration-accent;
+  }
+
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ─── 动效：只用三处，且都可被打断 ─────────────────────────────── */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(320%);
+  }
+}
+
+.animate-rise {
+  animation: rise 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.pulse-dot {
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+.sweep-bar::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  width: 30%;
+  background: linear-gradient(90deg, transparent, var(--color-accent), transparent);
+  animation: sweep 1.5s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-rise,
+  .pulse-dot,
+  .sweep-bar::after {
+    animation: none;
+  }
+}
+
+/* ─── 正文排版：读稿页单独一套 ─────────────────────────────────── */
+.prose-xing {
+  @apply font-serif text-[16.5px] leading-[1.95] text-ink;
+}
+
+.prose-xing p {
+  margin-block: 1.1em;
+}
+
+.prose-xing h2 {
+  @apply mt-9 mb-3 font-serif text-[21px] font-semibold;
+}
+
+.prose-xing h3 {
+  @apply mt-7 mb-2 font-serif text-[18px] font-semibold;
+}
+
+.prose-xing ul,
+.prose-xing ol {
+  margin-block: 1em;
+  padding-inline-start: 1.4em;
+}
+
+.prose-xing li {
+  margin-block: 0.4em;
+  list-style: disc;
+}
+
+.prose-xing ol > li {
+  list-style: decimal;
+}
+
+.prose-xing blockquote {
+  margin-block: 1.4em;
+  border-inline-start: 2px solid var(--color-accent);
+  padding-inline-start: 1em;
+  color: var(--color-ink-2);
+}
+
+.prose-xing strong {
+  font-weight: 600;
+}

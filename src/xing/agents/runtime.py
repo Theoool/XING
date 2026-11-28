@@ -24,7 +24,7 @@ import contextlib
 import hashlib
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -169,13 +169,36 @@ async def _explain_step_rejection(run_id: UUID) -> None:
     raise StepBudgetExceeded(f"步数预算耗尽（{step_count}/{max_steps}）")
 
 
-def make_replay_key(provider: str, model: str, system: str, prompt: str) -> str:
+def make_replay_key(
+    provider: str,
+    model: str,
+    system: str,
+    prompt: str,
+    *,
+    web_search: bool = False,
+    json_object: bool = False,
+) -> str:
     """录制回放的键。租户维度由唯一索引承担，不放进键里。
 
     同一个 workspace 内，同 provider / 同模型 / 同输入 才算「同一个请求」。
+    ``web_search`` 必须进键：同一段 prompt 带不带联网是两次不同的事实来源，
+    回放命中错的那个会把「没联网的回答」当成「检索结果」写进证据层。
+
+    版本号从 ``v2`` 升到 ``v3``，因为键的构成变了（多了 JSON 模式这一维）。
+    顺带的好处：此前录下的那批坏输出不会再被命中，不必手工清缓存。
     """
     digest = hashlib.sha256(
-        "\x00".join(["v1", provider, model, system, prompt]).encode("utf-8")
+        "\x00".join(
+            [
+                "v3",
+                provider,
+                model,
+                "web" if web_search else "text",
+                "json" if json_object else "raw",
+                system,
+                prompt,
+            ]
+        ).encode("utf-8")
     ).hexdigest()
     return digest
 
@@ -192,20 +215,34 @@ async def call_model(
     max_output_tokens: int | None = None,
     allow_replay: bool = True,
     shape: dict[str, Any] | None = None,
+    web_search: bool = False,
+    prompt_overhead: int | None = None,
+    temperature: float | None = None,
+    json_object: bool = False,
 ) -> LlmResponse:
     """预留 → 调用（事务外）→ 结算。三步各自独立事务。
 
     ``shape`` 只被 stub provider 使用（合成一个合法响应）；真实模型靠
     system prompt 里的输出指令。它不进 ``replay_key``：形状由 Agent 代码决定，
     不是请求内容，进键只会让「同一请求」被拆成两个键。
+
+    ``web_search`` 是模型端联网检索。它有两个额外后果：回放键要区分带不带联网；
+    预留额度必须加上供应商注入的检索上下文（``prompt_overhead``），
+    否则「预留是花费上界」不成立 —— 实测同一段 prompt 的 prompt_tokens
+    会因为检索正文从几百涨到七千。
+
+    ``json_object`` 与 ``temperature`` 同样进键：开了 JSON 模式的那次和没开的，
+    是两次不同的请求，输出形状也不同。少了这一维，回放可能把「随手写的一段话」
+    交给一个指望 JSON 的调用方。
     """
     prov = provider or get_provider()
     mdl = model or settings.llm_model
     max_out = max_output_tokens or price_of(mdl).max_output_tokens
-    replay_key = make_replay_key(prov.name, mdl, system, prompt)
-    amount = reserve_upper_bound(
-        mdl, len(system) + len(prompt) + PROMPT_OVERHEAD_CHARS, max_out
+    replay_key = make_replay_key(
+        prov.name, mdl, system, prompt, web_search=web_search, json_object=json_object
     )
+    overhead = PROMPT_OVERHEAD_CHARS if prompt_overhead is None else prompt_overhead
+    amount = reserve_upper_bound(mdl, len(system) + len(prompt) + overhead, max_out)
 
     # ---- 1. 预留（事务内）---------------------------------------------
     async with WorkerSession() as session:
@@ -216,8 +253,9 @@ async def call_model(
             raise RunNotRunning(f"run 不存在: {run_id}")
 
         if allow_replay:
-            replayed = await _replay(session, run_id, workspace_id, replay_key, purpose,
-                                     step_no, prov.name, mdl)
+            replayed = await _replay(
+                session, run_id, workspace_id, replay_key, purpose, step_no, prov.name, mdl
+            )
             if replayed is not None:
                 await session.commit()
                 log.info(
@@ -241,9 +279,7 @@ async def call_model(
             .execution_options(synchronize_session=False)
         )
         if reserved is None:
-            status = await session.scalar(
-                select(AgentRun.status).where(AgentRun.id == run_id)
-            )
+            status = await session.scalar(select(AgentRun.status).where(AgentRun.id == run_id))
             if status != AgentRunStatus.RUNNING:
                 raise RunNotRunning(f"run 已终结（status={status}）")
             budget = (
@@ -266,7 +302,14 @@ async def call_model(
     started = time.perf_counter()
     try:
         response = await prov.complete(
-            model=mdl, system=system, prompt=prompt, max_output_tokens=max_out, shape=shape
+            model=mdl,
+            system=system,
+            prompt=prompt,
+            max_output_tokens=max_out,
+            shape=shape,
+            web_search=web_search,
+            temperature=temperature,
+            json_object=json_object,
         )
     except BaseException as exc:
         # 取消 / 网络抖动 / 供应商 5xx 都到这里。明细仍然要落 —— 失败调用
@@ -284,6 +327,10 @@ async def call_model(
         )
         raise
     latency_ms = int((time.perf_counter() - started) * 1000)
+    # 记住这次响应挂在哪把回放键上：上层解析不过时要靠它把这条输出从缓存里摘掉。
+    # 少了这两个字段，一份坏输出会被重试原样复读 —— 错误位置都一样，看起来像
+    # 模型每次都错在同一处，其实是我们在复读。
+    response = replace(response, replay_key=replay_key, workspace_id=workspace_id)
 
     # ---- 3. 结算（事务内）---------------------------------------------
     actual = cost_of(mdl, response.input_tokens, response.output_tokens)
@@ -339,50 +386,180 @@ async def call_structured[ModelT: BaseModel](
 
     修复调用花的是真钱，所以它也走 :func:`call_model`，也就同样被预留/结算
     与 ``llm_calls`` 覆盖 —— 不因为它叫"修复"就绕开账本。
+
+    **回放命中的坏输出不算一次失败。** 复读一段当时就没通过校验的文本，
+    既不花模型的钱也得不到新信息；先把它从缓存里摘掉再真问一次，这是
+    同一个请求的第一次真正执行，不该消耗修复机会。
     """
-    response = await call_model(
-        run_id,
-        purpose=purpose,
-        step_no=step_no,
-        system=system,
-        prompt=prompt,
-        max_output_tokens=max_output_tokens,
-        shape=shape,
-    )
+
+    async def ask(text: str, purpose_name: str, *, allow_replay: bool) -> LlmResponse:
+        return await call_model(
+            run_id,
+            purpose=purpose_name,
+            step_no=step_no,
+            system=system,
+            prompt=text,
+            max_output_tokens=max_output_tokens,
+            shape=shape,
+            allow_replay=allow_replay,
+            # 结构化输出走两道锁：解码层强制 JSON（``json_object``），
+            # 随机性压到接近贪心。0.7 对「长嵌套 JSON 里的引号」这件事太松了 ——
+            # 实测同一步连续两次都写坏，一次把数组写成了键值对，一次漏了引号。
+            json_object=True,
+            temperature=0.2,
+        )
+
+    response = await ask(prompt, purpose, allow_replay=True)
     parsed, error = _try_parse(schema, response.text)
+    if parsed is None and response.replayed:
+        await forget_replay(response)
+        response = await ask(prompt, purpose, allow_replay=False)
+        parsed, error = _try_parse(schema, response.text)
     if parsed is not None:
         return parsed
 
+    # 解析不过的输出不能留在回放缓存里：否则重试拿到的是同一段坏文本，
+    # 「第 20 行」这种位置每次都一样 —— 看起来像模型固执地错在同一处，
+    # 实际上是我们在复读自己录下的那次失败。
+    await forget_replay(response)
     log.warning(
-        "agent.output_invalid", run_id=str(run_id), step=step_no, purpose=purpose, error=error
+        "agent.output_invalid",
+        run_id=str(run_id),
+        step=step_no,
+        purpose=purpose,
+        error=error.partition("\n")[0],
     )
-    repaired = await call_model(
-        run_id,
-        purpose=LlmPurpose.REPAIR,
-        step_no=step_no,
-        system=system,
-        prompt=(
+    repaired = await ask(
+        (
             f"{prompt}\n\n"
-            "上一次输出无法解析为约定结构，错误：\n"
+            "上一次输出无法解析为约定结构。解析器给的位置、以及出错处附近的原文：\n"
             f"{error}\n\n"
-            "只输出一个合法 JSON 对象，不要 Markdown 代码块、不要任何解释。"
+            "请据此修正：只输出一个合法 JSON 对象；所有字符串值都要用双引号包起来，"
+            "不能在字符串里直接换行；不要 Markdown 代码块，不要任何解释。"
         ),
-        max_output_tokens=max_output_tokens,
-        shape=shape,
+        LlmPurpose.REPAIR,
+        allow_replay=True,
     )
     parsed, error = _try_parse(schema, repaired.text)
     if parsed is not None:
         return parsed
 
-    raise InvalidOutput(f"结构化输出两次不合法（{schema.__name__}）：{error}")
+    await forget_replay(repaired)
+    # 第一行是给人看的一句话（任务失败码里的 message），后面几行是给模型的修复线索。
+    first_line = error.partition("\n")[0]
+    raise InvalidOutput(f"结构化输出两次不合法（{schema.__name__}）：{first_line}")
 
 
 def _try_parse[ModelT: BaseModel](schema: type[ModelT], text: str) -> tuple[ModelT | None, str]:
-    """解析并校验。返回 (值, 错误描述)，二选一。"""
+    """解析并校验。返回 (值, 错误描述)，二选一。
+
+    错误描述的**第一行**是给人看的一句话（直接进 ``INVALID_OUTPUT`` 的 message），
+    后面几行是给模型看的修复线索：出错位置、附近原文、常见原因。
+    只告诉模型「第 20 行第 1 列解析失败」，它改不动 —— 它得先看到自己写坏的那两行。
+    """
     try:
         return schema.model_validate(_extract_json(text)), ""
+    except json.JSONDecodeError as exc:
+        value, fixed = _parse_with_quote_repair(schema, text)
+        if value is not None:
+            return value, ""
+        return None, _json_hint(exc, text, repaired=fixed)
     except (ValueError, ValidationError) as exc:
         return None, str(exc)[:1500]
+
+
+def _parse_with_quote_repair[ModelT: BaseModel](
+    schema: type[ModelT], text: str
+) -> tuple[ModelT | None, bool]:
+    """给「键后换行、值裸写」补引号，再解析一次。
+
+    这是唯一一处容错，收得很窄：只补引号，不改结构、不搬字段、不猜缺了什么。
+    补完必须**重新经过 ``json.loads`` 与 schema 校验**，过不了就当没补过 ——
+    所以最坏情况是回到原来的报错，不会把一段能用的输出判死，也不会把一段坏的
+    拼成看起来合法的东西。
+
+    为什么值得补：实测 qwen 写长中文值时反复这么干 ——
+    ``"claim":`` 换行之后直接跟一句中文。整段输出除了这一点完全正确，
+    finish_reason 还是 ``stop``。为这个关键字让整条链失败，代价远大于补一个引号。
+    补了就记日志，不静默。
+    """
+    fixed = _quote_bare_values(text)
+    if fixed is None:
+        return None, False
+    try:
+        value = schema.model_validate(_extract_json(fixed))
+    except (ValueError, ValidationError):
+        return None, False
+    log.warning("agent.json_repaired", schema=schema.__name__, kind="unquoted_value")
+    return value, True
+
+
+def _quote_bare_values(text: str) -> str | None:
+    """把 ``"key":`` 独占一行时后面那几行裸文本变成带引号的字符串。
+
+    值里已经带引号、或者值其实是对象/数组/数字的，一律不动 —— 那些情况加引号
+    会把语义改错，宁可交回给模型重答。
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    touched = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not _is_key_only(line):
+            out.append(line)
+            index += 1
+            continue
+
+        cursor = index + 1
+        chunk: list[str] = []
+        while cursor < len(lines) and not _starts_structure(lines[cursor]):
+            chunk.append(lines[cursor].strip())
+            cursor += 1
+        if not chunk or any('"' in part for part in chunk):
+            out.append(line)
+            index += 1
+            continue
+
+        out.append(f'{line.rstrip()} "{" ".join(chunk)}"')
+        touched = True
+        index = cursor
+
+    return "\n".join(out) if touched else None
+
+
+def _is_key_only(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.endswith(":") and stripped.startswith('"') and stripped.count('"') == 2
+
+
+def _starts_structure(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped[0] in "{}[]":
+        return True
+    return stripped.startswith('"') and ":" in stripped
+
+
+def _json_hint(exc: json.JSONDecodeError, text: str, *, repaired: bool = False) -> str:
+    """把「第 N 行」翻译成模型能据以修改的东西。"""
+    lines = text.splitlines()
+    index = min(max(exc.lineno - 1, 0), max(len(lines) - 1, 0))
+    window = "\n".join(lines[max(0, index - 1) : index + 2])[:400]
+    note = (
+        "注意：已经尝试给裸值补过引号，仍然不合法 —— 所以问题不在引号，"
+        "更可能是括号/逗号错位，或者把某个数组写成了键值对。\n"
+        if repaired
+        else ""
+    )
+    return (
+        f"{exc}\n"
+        f"{note}"
+        "出错位置的附近原文（不含行号）：\n"
+        f"{window}\n"
+        "常见原因：字符串值没加双引号、在字符串里直接换行、多写或漏写逗号/方括号。"
+    )
 
 
 def _extract_json(text: str) -> Any:
@@ -539,7 +716,37 @@ async def _replay(
         model=model_name,
         request=request or {},
         response=response or {},
+        replay_key=replay_key,
+        workspace_id=workspace_id,
+        replayed=True,
     )
+
+
+async def forget_replay(response: LlmResponse) -> None:
+    """把一份解析不过的输出从回放缓存里摘掉。
+
+    回放的本意是「同一个请求不重复付钱」，不是「同一个错误不重复犯」。
+    命中缓存时我们只确认过「那次 HTTP 成功了」，从没确认过「那段文本能用」；
+    于是一份坏输出被永久复读 —— 重试连报错的字符位置都一样，看着像模型固执，
+    其实是我们在放录音。摘掉键之后，下一次同样的请求会真的去问模型，
+    新响应再接管这把键（唯一索引只约束非空键，所以不会冲突）。
+
+    清缓存失败不该把一次还能重试的运行变成终态，所以异常只记日志。
+    """
+    key = response.replay_key
+    if not key or response.workspace_id is None:
+        return
+    try:
+        async with WorkerSession() as session:
+            await session.execute(
+                update(LlmCall)
+                .where(LlmCall.workspace_id == response.workspace_id, LlmCall.replay_key == key)
+                .values(replay_key=None)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+    except Exception:
+        log.warning("agent.replay_forget_failed", key=key[:12], exc_info=True)
 
 
 async def _next_call_seq(session: Any, run_id: UUID) -> int:

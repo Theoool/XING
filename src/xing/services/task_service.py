@@ -19,15 +19,22 @@ ORM 走的还是同一个 session，SQL 仍然被策略过滤。
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from xing.cache import heartbeat
 from xing.core.errors import ApiError
 from xing.models.task import Task, TaskStatus
-from xing.schemas.task import TaskCreate, TaskOut
+from xing.schemas.task import QueueStatus, TaskCreate, TaskOut
+
+#: 队列里「等人来领」与「正在跑」的分界。PENDING 是在等前置任务，
+#: 它没在等人，但也不在执行 —— 两条都不是「执行中」。
+_UNCLAIMED = (TaskStatus.PENDING, TaskStatus.READY)
+_RUNNING = (TaskStatus.RUNNING, TaskStatus.RETRYING)
 
 
 def _to_out(task: Task) -> TaskOut:
@@ -91,9 +98,7 @@ async def create_task(session: AsyncSession, *, workspace_id: UUID, payload: Tas
         ).scalar_one()
     else:
         # 重新 SELECT：RETURNING 在 AFTER 触发器之前求值，状态可能是旧的。
-        task = (
-            await session.execute(select(Task).where(Task.id == inserted))
-        ).scalar_one()
+        task = (await session.execute(select(Task).where(Task.id == inserted))).scalar_one()
     await session.commit()
     return _to_out(task)
 
@@ -126,6 +131,57 @@ async def list_tasks(
 
     tasks = (await session.execute(stmt)).scalars().all()
     return [_to_out(task) for task in tasks]
+
+
+async def queue_status(session: AsyncSession, *, workspace_id: UUID) -> QueueStatus:
+    """这个工作区的队列现在是什么样，以及有没有人在消费它。
+
+    任务列表只能回答「每条任务是什么状态」，回答不了「为什么它一直不动」。
+    这一步把两个事实并排放：队列里堆了多少，以及活着的 worker 有几个。
+    两者相加才是可诊断的状态 —— 没有 worker 时，``READY`` 不是「即将执行」，
+    而是「永远不执行」。
+    """
+    counts = dict(
+        (
+            await session.execute(
+                select(Task.status, func.count())
+                .where(
+                    Task.workspace_id == workspace_id,
+                    Task.status.in_(_UNCLAIMED + _RUNNING),
+                )
+                .group_by(Task.status)
+            )
+        ).all()
+    )
+    queued = sum(counts.get(status, 0) for status in _UNCLAIMED)
+    running = sum(counts.get(status, 0) for status in _RUNNING)
+
+    oldest = (
+        await session.execute(
+            select(func.min(Task.created_at)).where(
+                Task.workspace_id == workspace_id,
+                Task.status.in_(_UNCLAIMED),
+            )
+        )
+    ).scalar_one_or_none()
+    oldest_wait_s = None
+    if oldest is not None:
+        oldest_wait_s = max(0, int((datetime.now(UTC) - oldest).total_seconds()))
+
+    workers = await heartbeat.live()
+    alive = None if workers is None else len(workers)
+    return QueueStatus(
+        workers_online=alive,
+        queued=queued,
+        running=running,
+        oldest_wait_s=oldest_wait_s,
+        # 读不到心跳时（alive is None）不冒充结论：宁可不说，也不要让人去重启一个正常的进程。
+        #
+        # ``running > 0`` 也要算：租约回收（``reclaim_expired``）同样长在 worker
+        # 的主循环里，worker 全掉线时那条 RUNNING 任务没有任何人会回收，会永远
+        # 停在执行中 —— 它看起来最像「在跑」，实际上是最不该等的一种。
+        stalled=alive == 0 and (queued > 0 or running > 0),
+    )
 
 
 async def cancel_task(

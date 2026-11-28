@@ -110,9 +110,7 @@ async def _upsert_event(task: TaskContext, result: schemas.ResearchResult, run_i
                     "source_notes": result.source_notes,
                 },
             )
-            .on_conflict_do_nothing(
-                index_elements=["workspace_id", "source_type", "external_id"]
-            )
+            .on_conflict_do_nothing(index_elements=["workspace_id", "source_type", "external_id"])
             .returning(ExternalEvent.id)
         )
         if inserted is not None:

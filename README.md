@@ -1,6 +1,6 @@
 # XING
 
-AIXING 后端服务。本地开发环境基于 Docker Compose 一键拉起，生产镜像与开发镜像共用同一份 Dockerfile。
+AIXING 的选题与内容生成系统：Python 后端 + Vue 前端。本地开发环境基于 Docker Compose 一键拉起，生产镜像与开发镜像共用同一份 Dockerfile。
 
 ## 技术栈
 
@@ -8,6 +8,7 @@ AIXING 后端服务。本地开发环境基于 Docker Compose 一键拉起，生
 |---|---|---|
 | 运行时 | Python 3.12 + uv | 依赖由 `uv.lock` 锁定，构建可复现 |
 | Web | FastAPI + Uvicorn | 开发态热重载，生产多 worker |
+| 前端 | Vue 3 + Vite + TypeScript | Pinia + Vue Router + Tailwind 4，见 `web/README.md` |
 | 数据 | PostgreSQL 18 + pgvector 0.8 | 原生 `uuidv7()`，无需 uuid-ossp |
 | 缓存 | Redis 7.4 | AOF 持久化 + LRU 淘汰，可兼做队列 |
 | ORM | SQLAlchemy 2.x (async) + asyncpg | 全异步链路 |
@@ -19,10 +20,13 @@ AIXING 后端服务。本地开发环境基于 Docker Compose 一键拉起，生
 ```bash
 cp .env.example .env          # 首次
 docker compose up -d          # 首次会构建镜像，约 1-3 分钟
+
+cd web && npm install && npm run dev   # 前端：http://localhost:5173
 ```
 
 启动后：
 
+- 前端「选题台」<http://localhost:5173>
 - API 文档 <http://localhost:8000/docs>
 - 就绪检查 <http://localhost:8000/readyz>
 - 数据库客户端：`./dev.sh tools` → <http://localhost:8080>（服务器填 `db`，用户名 `xing`，密码 `xing_dev_pwd`，库 `xing`）
@@ -64,13 +68,19 @@ docker compose up -d          # 首次会构建镜像，约 1-3 分钟
 │   ├── models/                 # 20 张表的 ORM 映射（唯一 schema 真相）
 │   ├── services/               # 业务逻辑（全部 ORM，无手写 SQL）
 │   ├── worker/                 # 队列：领取 / 续租 / 回收 / 收尾（fencing）
-│   └── agents/                 # Agent 运行时：定价 / provider / runtime / writer
+│   ├── agents/                 # Agent 运行时：定价 / provider / runtime / writer
+│   └── search/                 # 检索后端（tavily/qwen/stub）+ 来源分类（sources.py）
 ├── alembic/
 │   ├── sql/v01_schema.sql      # v0.1 DDL 正文
-│   └── versions/               # 迁移：0003 P0、0004 选题唯一、0005 Agent 层、0006 fencing、0007 契约收紧
-├── scripts/app_role.sql        # 应用角色与授权（RLS 前提）
+│   └── versions/               # 迁移：0003 P0 …… 0009 选题管线、0010 证据引文、
+│                               #       0011 立场、0012 取证轨迹
+├── scripts/app_role.sql        # 应用角色与授权（RLS 前提；含轨迹表 append-only）
 ├── scripts/worker_role.sql     # worker 角色（BYPASSRLS，仅运行期表）
 ├── docker/postgres/init/       # 首次建库：扩展、参数、应用角色
+├── web/                        # Vue 3 前端（选题台 / 内容库 / 任务流 / 取证过程）
+│   ├── src/api/                # 客户端、problem+json 错误映射、类型
+│   ├── src/stores/             # workspace（租户）/ chain（链路状态机）
+│   └── src/views/              # 五个页面
 └── tests/
     ├── sql/                    # smoke_v01 / p0_check / rls_check
     ├── test_health.py
@@ -94,6 +104,7 @@ make help          # 装了 make（macOS / Linux / WSL）
 | 进容器 | `make sh` | `./dev.sh sh` |
 | 进 psql | `make db` | `./dev.sh db` |
 | 跑测试 | `make test` | `./dev.sh test` |
+| 起前端 | `make web` | `cd web && npm run dev` |
 | 格式化 | `make fmt` | `./dev.sh fmt` |
 | 静态检查 | `make lint` | `./dev.sh lint` |
 | 生成迁移 | `make revision m="..."` | `./dev.sh revision "..."` |
@@ -108,7 +119,19 @@ make help          # 装了 make（macOS / Linux / WSL）
 
 ## 开发流程
 
-**改业务代码**：直接改 `src/`，Uvicorn 热重载，无需重启容器。
+**改业务代码**：直接改 `src/`。
+
+- **API 热重载**（`uvicorn --reload --reload-dir /app/src`），不用重启容器。
+- **worker 不会**。它跑的是 `python -m xing.worker.main`，启动时把模块导入内存，
+  之后改文件对它没有任何影响：
+
+  ```bash
+  ./dev.sh workerrestart        # 改过 agents/ worker/ search/ 之后必须执行
+  ```
+
+  这条不是洁癖。踩过一次：修好了 `runtime.py` 的回放逻辑，重试仍然报一模一样的
+  错误 —— 因为 worker 是改之前启动的，它一直在跑旧模块。看日志能分辨：
+  `worker.started` 的时间早于 `git status` 里文件的修改时间，就是在跑旧代码。
 
 **加依赖**：改 `pyproject.toml` → 本机 `uv lock` → `./dev.sh build`。锁文件不一致时镜像构建会主动失败（`--frozen`），这是刻意的。
 

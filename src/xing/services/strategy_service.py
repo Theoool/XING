@@ -22,7 +22,7 @@ from sqlalchemy.orm import lazyload
 
 from xing.core.errors import ApiError
 from xing.models.strategy import Strategy, StrategyStatus, StrategyVersion
-from xing.schemas.strategy import StrategyOut
+from xing.schemas.strategy import StrategyOut, StrategyVersionListOut
 
 
 def _to_out(strategy: Strategy) -> StrategyOut:
@@ -51,7 +51,6 @@ async def create_strategy(
         lock_version=0,
     )
     session.add(strategy)
-
 
     await session.flush()
 
@@ -120,6 +119,87 @@ async def get_active_strategy(session: AsyncSession, *, workspace_id: UUID) -> S
     if strategy is None:
         raise ApiError(404, "NO_ACTIVE_STRATEGY", "当前没有生效中的战略")
     return _to_out(strategy)
+
+
+async def rename_strategy(
+    session: AsyncSession, *, workspace_id: UUID, strategy_id: UUID, name: str
+) -> StrategyOut:
+    """改名。不动 current_version_number，也不动 lock_version ——
+
+    lock_version 记的是「配置改过几次」，名字不是配置。改个名字就让版本号
+    看起来变紧，会让审计里对不上号。
+    """
+    strategy = (
+        await session.execute(
+            select(Strategy)
+            .options(lazyload(Strategy.current_version))
+            .where(Strategy.workspace_id == workspace_id, Strategy.id == strategy_id)
+        )
+    ).scalar_one_or_none()
+
+    if strategy is None:
+        raise ApiError(404, "STRATEGY_NOT_FOUND", "战略不存在")
+
+    strategy.name = name
+    await session.commit()
+    return await get_strategy(session, workspace_id=workspace_id, strategy_id=strategy_id)
+
+
+async def list_versions(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    strategy_id: UUID,
+    limit: int = 20,
+) -> list[StrategyVersionListOut]:
+    """版本历史，新到旧。
+
+    先确认战略属于本工作区：直接查版本表也能得到「空列表」，但空列表和
+    「战略不存在」在前端是两种完全不同的提示（一个是「刚建还没改过」，
+    另一个是「你拿错 id 了」），所以这里必须先把 404 分出来。
+
+    只取 ``current_version_number`` 而不是整个 ``Strategy``：``current_version``
+    是 joined eager load，为了一个整数把版本行再 join 一次没有意义。
+    """
+    current = (
+        await session.execute(
+            select(Strategy.current_version_number).where(
+                Strategy.workspace_id == workspace_id, Strategy.id == strategy_id
+            )
+        )
+    ).scalar_one_or_none()
+
+    if current is None:
+        raise ApiError(404, "STRATEGY_NOT_FOUND", "战略不存在")
+
+    versions = (
+        (
+            await session.execute(
+                select(StrategyVersion)
+                .where(
+                    StrategyVersion.workspace_id == workspace_id,
+                    StrategyVersion.strategy_id == strategy_id,
+                )
+                .order_by(StrategyVersion.version_number.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return [
+        StrategyVersionListOut(
+            id=version.id,
+            version_number=version.version_number,
+            strategy_config=version.strategy_config,
+            change_summary=version.change_summary,
+            created_by=version.created_by,
+            created_at=version.created_at,
+            is_current=version.version_number == current,
+        )
+        for version in versions
+    ]
 
 
 async def add_version(

@@ -46,6 +46,7 @@ async def claim_one(
     *,
     worker_id: str,
     agent: str | None = None,
+    workspace_id: UUID | None = None,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
 ) -> Task | None:
     """领取一个任务并置为 RUNNING。
@@ -55,6 +56,10 @@ async def claim_one(
 
     ``SKIP LOCKED`` 让多个 worker 永远不会抢到同一行；配合租约，
     不需要任何分布式锁。
+
+    ``workspace_id`` 把领取范围钉在一个租户上。默认不传 = 全租户共享池
+    （生产的常态）；需要时（按租户隔离的 worker 池、测试里只跑自己的队列）
+    可以收紧，否则「领到别人的任务」是不可控的。
     """
     stmt = (
         select(Task)
@@ -66,10 +71,10 @@ async def claim_one(
         .limit(1)
         .with_for_update(skip_locked=True)
     )
+    if workspace_id is not None:
+        stmt = stmt.where(Task.workspace_id == workspace_id)
     if agent is not None:
-        stmt = stmt.where(
-            or_(Task.assigned_agent.is_(None), Task.assigned_agent == agent)
-        )
+        stmt = stmt.where(or_(Task.assigned_agent.is_(None), Task.assigned_agent == agent))
 
     task = (await session.execute(stmt)).scalar_one_or_none()
     if task is None:

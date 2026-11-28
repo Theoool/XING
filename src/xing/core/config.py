@@ -64,6 +64,27 @@ class Settings(BaseSettings):
     # False = 通过 extra_body 显式关闭思考。这是供应商相关开关，不是通用语义。
     llm_enable_thinking: bool | None = None
 
+    # ---------------- 检索 ----------------
+    #
+    # stub   = 确定性假结果，离线测试与无 key 环境用（**不含任何真实信息**）
+    # tavily = 显式搜索 API，返回标题/链接/正文片段，证据可回溯到原文
+    # qwen   = 模型端联网搜索（复用 OPENAI_* 配置），返回带原话与出处的结构化结论，
+    #          但没有可点击链接 —— 证据只能回溯到「摘要」，不能回溯到网页
+    #
+    # 默认 stub 的理由与 llm_provider 相同：没有 key 也要能把整条链路跑通。
+    # 但生产/演示必须显式改成 tavily 或 qwen，否则内容里的「事实」是假数据。
+    search_provider: str = "stub"
+    search_api_key: str = ""
+    search_base_url: str = "https://api.tavily.com"
+    search_timeout: float = 25.0
+    #: 每条 query 要几条结果。检索越深，证据越全，也越贵。
+    search_max_results: int = 4
+
+    #: 联网检索时，供应商会把检索到的全文塞进 prompt（实测一次约 7000 tokens），
+    #: 这部分字符不在我们发出的 prompt 里。预算预留必须把它算进去，否则
+    #: 「预留额是真实花费的上界」这条不变式会被打破，结算时触发预算 CHECK。
+    search_context_chars: int = 24000
+
     @field_validator("llm_enable_thinking", mode="before")
     @classmethod
     def _blank_means_unset(cls, value: object) -> object:

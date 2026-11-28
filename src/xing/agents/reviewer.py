@@ -27,6 +27,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from xing.agents import runtime, schemas, upstream
+from xing.agents.writer import length_guide
 from xing.core.errors import NonRetryableError
 from xing.db.worker import WorkerSession
 from xing.models.content import (
@@ -40,6 +41,7 @@ from xing.models.content import (
 from xing.models.event import ExternalEvent
 from xing.models.runtime import LlmPurpose
 from xing.models.task import Task
+from xing.models.topic import TopicEvent
 from xing.worker.context import TaskContext
 from xing.worker.handlers import handler
 
@@ -64,6 +66,8 @@ SYSTEM_PROMPT = """你是 XING 的内容审核 Agent。
 2. 语气被加强也算失真：基线说「预测/尚未发布」，正文写成「指出/已证明」，
    记一条 issue 并扣分 —— 结论强度是事实的一部分。
 3. 基线本身为空时，正文仍可以写，但凡出现出处与数字一律记 issue。
+4. 基线带 [编号] 时，正文里标的编号必须是基线里存在的；引用的意思要与原文一致 ——
+   把「预测」写成「已证实」、把个案写成普遍现象，都算失真。
 
 只输出 JSON：{"verdict": "PASS", "score": 85, "issues": []}
 不要输出任何解释、不要 Markdown 代码块。
@@ -83,6 +87,9 @@ class Snapshot:
     content_type: str
     status: str
     body: str
+    #: 写作时写进 ``content_versions.metadata`` 的篇幅档。审核按**当时**的
+    #: 标准判，而不是当前代码里的标准 —— 改了档位不该让旧稿追溯性变短。
+    meta: dict[str, Any]
 
 
 @handler("review_content")
@@ -118,6 +125,8 @@ async def review_content(task: TaskContext) -> dict[str, Any]:
             shape=schemas.REVIEW_SHAPE,
             max_output_tokens=1000,
         )
+        # 机检在模型之后：字数是硬事实，模型判 PASS 也改不了它。
+        verdict = _length_gate(verdict, snapshot)
         approval_id = await _request_approval(task, content_id=snapshot.id)
         await runtime.finish_run(
             run_id,
@@ -127,6 +136,7 @@ async def review_content(task: TaskContext) -> dict[str, Any]:
                 "verdict": verdict.verdict,
                 "score": verdict.score,
                 "issues": verdict.issues,
+                "chars": len("".join(snapshot.body.split())),
             },
         )
     except BaseException as exc:
@@ -139,12 +149,18 @@ async def review_content(task: TaskContext) -> dict[str, Any]:
         content_id=str(snapshot.id),
         verdict=verdict.verdict,
         score=verdict.score,
+        chars=len("".join(snapshot.body.split())),
     )
     return {
         "content_id": str(snapshot.id),
         "approval_id": str(approval_id),
         "verdict": verdict.verdict,
         "score": verdict.score,
+        # issues 也必须进 task.output：run.output 只有内部审计能读，
+        # 而接口对外暴露的是 task.output。少了它，界面只能看到 FAIL
+        # 却不知道要改什么，人工返工就无从下手。
+        "issues": verdict.issues,
+        "chars": len("".join(snapshot.body.split())),
         "run_id": str(run_id),
     }
 
@@ -182,21 +198,23 @@ async def _load_content(task: TaskContext, content_id: UUID) -> Snapshot:
 
         version = (
             await session.execute(
-                select(ContentVersion.body).where(
+                select(ContentVersion.body, ContentVersion.extra_metadata).where(
                     ContentVersion.content_id == content_id,
                     ContentVersion.version_number == row.current_version_number,
                 )
             )
-        ).scalar_one_or_none()
+        ).first()
         if version is None:
             raise NonRetryableError(f"内容没有正文版本: {content_id}", code="MISSING_BODY")
+        body, meta = version
 
         return Snapshot(
             id=row.id,
             title=row.title,
             content_type=row.content_type,
+            meta=dict(meta or {}),
             status=row.status,
-            body=version,
+            body=body,
         )
 
 
@@ -212,14 +230,55 @@ def _build_prompt(snapshot: Snapshot, focus: str, facts: str) -> str:
     )
 
 
+def _length_gate(verdict: schemas.ReviewVerdict, snapshot: Snapshot) -> schemas.ReviewVerdict:
+    """篇幅机检：字数是算得出来的，不该交给 judge 估。
+
+    两档处理 —— 低于下限记一条 issue 扣分；低于下限的 80% 直接判 FAIL。
+    「少 30 字」是收尾仓促，补一句就能交；「少 400 字」是没写完，得重写，
+    两者返工方式不同，不该给同一个结论。
+
+    下限优先取写作时写进 metadata 的值：改了档位不该让旧稿追溯性变短。
+    """
+    guide = length_guide(snapshot.content_type)
+    raw_floor = snapshot.meta.get("length_floor")
+    floor = raw_floor if isinstance(raw_floor, int) and raw_floor > 0 else guide.floor
+    chars = len("".join(snapshot.body.split()))
+    if chars >= floor:
+        return verdict
+
+    hard = chars < int(floor * 0.8)
+    issue = f"篇幅不足：正文 {chars} 字，{guide.label}下限 {floor} 字" + (
+        "，明显没写完" if hard else "，收尾偏仓促"
+    )
+    score = 0 if hard else max(0, verdict.score - 15)
+    return verdict.model_copy(
+        update={
+            "verdict": "FAIL" if hard or score < 60 else verdict.verdict,
+            "score": score,
+            "issues": [*verdict.issues, issue],
+        }
+    )
+
+
 async def _load_facts(task: TaskContext) -> str:
     """取写作时用过的事实基线。
 
-    走两个指针：``research_task_id`` → 该任务 ``output.event_id`` →
-    ``external_events.summary``。不直接从 ``tasks.output`` 读 summary：
-    ``output`` 只放指针是一条硬约定，正文与证据一律回业务表取，
-    否则审核看到的是可能已被覆盖的旧快照，而不是这次真正引用的事实。
+    两条路，取决于内容从哪条链来的：
+
+    - 选题链：``topic_id`` → ``topic_events`` 的证据（带角色与原文）。
+      这是更硬的一种 —— 每条基线都能指回一条检索材料。
+    - 目标链：``research_task_id`` → 该任务 ``output.event_id`` →
+      ``external_events.summary``。只有一条摘要，所以它对「正文有没有夸大」
+      的判断力天然更弱。
+
+    不直接从 ``tasks.output`` 读 summary：``output`` 只放指针是一条硬约定，
+    正文与证据一律回业务表取，否则审核看到的是可能已被覆盖的旧快照，
+    而不是这次真正引用的事实。
     """
+    topic_id = task.input.get("topic_id")
+    if topic_id:
+        return await _load_evidence_facts(task, UUID(str(topic_id)))
+
     raw_task_id = task.input.get("research_task_id")
     if not raw_task_id:
         return ""
@@ -241,6 +300,43 @@ async def _load_facts(task: TaskContext) -> str:
             )
         )
     return str(summary or "")
+
+
+async def _load_evidence_facts(task: TaskContext, topic_id: UUID) -> str:
+    """把 ``topic_events`` 渲染成审核读的事实基线。编号与写作时一致。"""
+    async with WorkerSession() as session:
+        rows = (
+            await session.execute(
+                select(
+                    TopicEvent.role,
+                    TopicEvent.quote,
+                    ExternalEvent.title,
+                    ExternalEvent.summary,
+                    ExternalEvent.url,
+                    ExternalEvent.raw_payload,
+                )
+                .join(ExternalEvent, ExternalEvent.id == TopicEvent.event_id)
+                .where(
+                    TopicEvent.topic_id == topic_id,
+                    ExternalEvent.workspace_id == task.workspace_id,
+                )
+                .order_by(TopicEvent.weight.desc(), TopicEvent.created_at, TopicEvent.event_id)
+                .limit(8)
+            )
+        ).all()
+
+    lines: list[str] = []
+    for role, quote, title, summary, url, raw in rows:
+        body = str(quote or summary or "").strip()
+        if not body:
+            continue
+        label = str((raw or {}).get("source_label") or "").strip()
+        lines.append(
+            f"[{len(lines) + 1}] {role}《{str(title)[:80]}》\n"
+            f'    原文："{body[:400]}"\n'
+            f"    来源：{url or label or '来源未注明'}"
+        )
+    return "\n".join(lines)
 
 
 async def _request_approval(task: TaskContext, *, content_id: UUID) -> UUID:

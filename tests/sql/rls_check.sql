@@ -30,10 +30,18 @@ VALUES (:'wa', 'writer', 'rls check') RETURNING id AS run_a \gset
 INSERT INTO llm_calls (workspace_id, run_id, model_provider, model_name, purpose, call_seq)
 VALUES (:'wa', :'run_a', 'openai', 'gpt-x', 'generate', 1);
 
+-- 取证轨迹：里面是检索词原文和材料 URL，泄漏等于泄漏「这题怎么查的」，
+-- 比泄漏结论更难堪。它靠复合外键挂在任务上，所以先建任务。
+INSERT INTO tasks (workspace_id, task_type, input)
+VALUES (:'wa', 'echo', '{}') RETURNING id AS task_a \gset
+INSERT INTO retrieval_traces (workspace_id, task_id, layer, query, provider, status)
+VALUES (:'wa', :'task_a', 'MEDIA', 'A 的检索词', 'tavily', 'OK');
+
 SELECT 'A@WA 可见内容' AS check, count(*) AS n FROM contents;
 SELECT 'A@WA 可见选题' AS check, count(*) AS n FROM topics;
 SELECT 'A@WA 可见 run' AS check, count(*) AS n FROM agent_runs;
 SELECT 'A@WA 可见 llm_call' AS check, count(*) AS n FROM llm_calls;
+SELECT 'A@WA 可见轨迹' AS check, count(*) AS n FROM retrieval_traces;
 
 -- B 拿着 WA 的上下文，应当看不到任何东西
 SET LOCAL app.user_id = :'ub';
@@ -43,6 +51,7 @@ SELECT 'B@WA 可见内容(应 0)' AS check, count(*) AS n FROM contents;
 SELECT 'B@WA 可见选题(应 0)' AS check, count(*) AS n FROM topics;
 SELECT 'B@WA 可见 run(应 0)' AS check, count(*) AS n FROM agent_runs;
 SELECT 'B@WA 可见 llm_call(应 0)' AS check, count(*) AS n FROM llm_calls;
+SELECT 'B@WA 可见轨迹(应 0)' AS check, count(*) AS n FROM retrieval_traces;
 
 -- B 尝试往 WA 里写，应被 WITH CHECK 拒绝
 DO $t$
@@ -63,6 +72,7 @@ $t$;
 SELECT set_config('app.workspace_id', '', true), set_config('app.user_id', '', true);
 SELECT '无上下文可见内容(应 0)' AS check, count(*) AS n FROM contents;
 SELECT '无上下文可见 run(应 0)' AS check, count(*) AS n FROM agent_runs;
+SELECT '无上下文可见轨迹(应 0)' AS check, count(*) AS n FROM retrieval_traces;
 
 ROLLBACK;
 

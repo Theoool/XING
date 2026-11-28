@@ -14,7 +14,9 @@ from xing.schemas.event import EventIngest, EventIngestResult, EventOut
 from xing.schemas.strategy import (
     StrategyCreate,
     StrategyOut,
+    StrategyUpdate,
     StrategyVersionCreate,
+    StrategyVersionListOut,
     StrategyVersionOut,
 )
 from xing.schemas.task import TaskCreate, TaskOut
@@ -38,7 +40,9 @@ __all__ = [
     "Page",
     "StrategyCreate",
     "StrategyOut",
+    "StrategyUpdate",
     "StrategyVersionCreate",
+    "StrategyVersionListOut",
     "StrategyVersionOut",
     "TaskCreate",
     "TaskOut",

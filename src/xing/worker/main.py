@@ -7,6 +7,9 @@
     每 30 秒  回收租约过期的 RUNNING
     每 120 秒 对账僵尸 run（任务已终态或超时，却还停在 RUNNING）
 
+另外有一个独立协程每 5 秒往 Redis 写一次心跳（见 ``_heartbeat``）：
+队列是拉模型，没有心跳就没人知道 worker 是死了还是在忙。
+
 不做成独立协程，是因为它们都要写同一张 tasks 表，
 分开跑反而要处理互相等待；一个循环里按时间戳节流更简单，也更容易在测试里驱动。
 
@@ -25,6 +28,8 @@ import time
 
 import structlog
 
+from xing.cache import heartbeat
+from xing.cache.redis import close_redis
 from xing.core.config import settings
 from xing.core.logging import setup_logging
 from xing.worker import queue, reaper, runner
@@ -37,6 +42,21 @@ POLL_INTERVAL = 1.0
 PROMOTE_INTERVAL = 5.0
 RECLAIM_INTERVAL = 30.0
 REAP_INTERVAL = 120.0
+
+
+async def _heartbeat(worker_id: str, agent: str | None, stop: asyncio.Event) -> None:
+    """独立协程发心跳。
+
+    不能跟着主循环写：主循环跑一个 expand 会占住 30~40 秒，跑一趟重试更久，
+    心跳跟着它就会在「正在干活」的时候过期，界面反而报 worker 不在。
+    Redis 挂了只记一条日志，不退出 —— 队列能不能消费不取决于心跳。
+    """
+    while not stop.is_set():
+        try:
+            await heartbeat.beat(worker_id, agent=agent)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("worker.heartbeat_failed", error=str(exc))
+        await asyncio.sleep(heartbeat.INTERVAL)
 
 
 async def serve(
@@ -59,44 +79,53 @@ async def serve(
     last_reap = 0.0
     idle = 0
 
-    while not stop.is_set():
-        now = time.monotonic()
+    # 心跳与主循环并发：主循环被任务占住时，心跳仍要按时写。
+    hb = asyncio.create_task(_heartbeat(worker_id, agent, stop))
 
-        if now - last_promote >= PROMOTE_INTERVAL:
-            last_promote = now
-            async with WorkerSession() as session:
-                promoted = await queue.promote_retrying(session)
-            if promoted:
-                log.info("worker.promoted", count=promoted)
+    try:
+        while not stop.is_set():
+            now = time.monotonic()
 
-        if now - last_reclaim >= RECLAIM_INTERVAL:
-            last_reclaim = now
-            async with WorkerSession() as session:
-                retrying, failed = await queue.reclaim_expired(session)
-            if retrying or failed:
-                log.warning("worker.reclaimed", to_retry=retrying, to_failed=failed)
+            if now - last_promote >= PROMOTE_INTERVAL:
+                last_promote = now
+                async with WorkerSession() as session:
+                    promoted = await queue.promote_retrying(session)
+                if promoted:
+                    log.info("worker.promoted", count=promoted)
 
-        if now - last_reap >= REAP_INTERVAL:
-            last_reap = now
-            async with WorkerSession() as session:
-                reaped = await reaper.reap_stale_runs(session)
-            if reaped:
-                # 这是异常信号：正常路径上 run 一定在任务终结前收尾。
-                log.warning("worker.reaped_orphan_runs", count=reaped)
+            if now - last_reclaim >= RECLAIM_INTERVAL:
+                last_reclaim = now
+                async with WorkerSession() as session:
+                    retrying, failed = await queue.reclaim_expired(session)
+                if retrying or failed:
+                    log.warning("worker.reclaimed", to_retry=retrying, to_failed=failed)
 
-        try:
-            outcome = await runner.claim_and_run(worker_id=worker_id, agent=agent)
-        except Exception:
-            # 单次执行失败不能让整个 worker 退出：队列里还有别人的任务
-            log.exception("worker.tick_failed")
-            outcome = None
+            if now - last_reap >= REAP_INTERVAL:
+                last_reap = now
+                async with WorkerSession() as session:
+                    reaped = await reaper.reap_stale_runs(session)
+                if reaped:
+                    # 这是异常信号：正常路径上 run 一定在任务终结前收尾。
+                    log.warning("worker.reaped_orphan_runs", count=reaped)
 
-        if outcome is None:
-            idle += 1
-            # 空闲退避，上限 5 秒。不用固定 1 秒轮询，是为了让空队列时数据库安静。
-            await asyncio.sleep(min(poll_interval * min(idle, 5), 5.0))
-        else:
-            idle = 0
+            try:
+                outcome = await runner.claim_and_run(worker_id=worker_id, agent=agent)
+            except Exception:
+                # 单次执行失败不能让整个 worker 退出：队列里还有别人的任务
+                log.exception("worker.tick_failed")
+                outcome = None
+
+            if outcome is None:
+                idle += 1
+                # 空闲退避，上限 5 秒。不用固定 1 秒轮询，是为了让空队列时数据库安静。
+                await asyncio.sleep(min(poll_interval * min(idle, 5), 5.0))
+            else:
+                idle = 0
+    finally:
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+        await heartbeat.retire(worker_id)
 
     log.info("worker.stopped", worker_id=worker_id)
 
@@ -113,6 +142,7 @@ async def _main(agent: str | None) -> None:
         await serve(agent=agent, stop=stop)
     finally:
         await dispose()
+        await close_redis()
 
 
 def main() -> None:

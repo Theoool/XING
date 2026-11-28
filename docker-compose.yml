@@ -23,6 +23,15 @@ x-app-env: &app-env
   LLM_MODEL: ${LLM_MODEL:-stub-1}
   # 仅对思考型模型（qwen3 等）有意义。留空 = 不发送该字段。
   LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-}
+  # 检索后端。stub = 确定性假结果（离线测试）；tavily = 显式搜索 API；
+  # qwen = 模型端联网搜索（复用上面的 OPENAI_*，需 LLM_PROVIDER=openai）。
+  #
+  # 默认为 stub 的理由和 LLM_PROVIDER 一样：没有 key 也要能把链路跑通。
+  # 但 stub 产出的「证据」是假的，deepen 会在 brief.search.degraded 里标出来。
+  SEARCH_PROVIDER: ${SEARCH_PROVIDER:-stub}
+  SEARCH_API_KEY: ${SEARCH_API_KEY:-}
+  SEARCH_BASE_URL: ${SEARCH_BASE_URL:-https://api.tavily.com}
+  SEARCH_MAX_RESULTS: ${SEARCH_MAX_RESULTS:-4}
 
 services:
   db:

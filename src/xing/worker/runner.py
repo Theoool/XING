@@ -92,9 +92,7 @@ async def _race_with_lease(coro: Any, lost: asyncio.Event) -> dict[str, Any]:
     work = asyncio.create_task(coro)
     guard = asyncio.create_task(lost.wait())
     try:
-        done, pending = await asyncio.wait(
-            {work, guard}, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, pending = await asyncio.wait({work, guard}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         for task in (work, guard):
             if not task.done():
@@ -120,11 +118,7 @@ async def run_task(
     try:
         async with WorkerSession() as session:
             task = await session.get(Task, task_id)
-            if (
-                task is None
-                or task.locked_by != worker_id
-                or task.status != TaskStatus.RUNNING
-            ):
+            if task is None or task.locked_by != worker_id or task.status != TaskStatus.RUNNING:
                 return Outcome("SKIPPED", "租约不属于本 worker")
 
             # 本次执行的代次。之后所有写入都必须带上它。
@@ -197,11 +191,7 @@ async def _record_failure(
 ) -> Outcome:
     async with WorkerSession() as session:
         task = await session.get(Task, task_id)
-        if (
-            task is None
-            or task.locked_by != worker_id
-            or task.lease_generation != generation
-        ):
+        if task is None or task.locked_by != worker_id or task.lease_generation != generation:
             return Outcome("LEASE_LOST")
 
         now = datetime.now(UTC)
@@ -249,12 +239,21 @@ async def claim_and_run(
     *,
     worker_id: str,
     agent: str | None = None,
+    workspace_id: UUID | None = None,
     lease_seconds: int = queue.DEFAULT_LEASE_SECONDS,
 ) -> Outcome | None:
-    """领取并执行一个任务。队列空时返回 None。"""
+    """领取并执行一个任务。队列空时返回 None。
+
+    ``workspace_id`` 透传给 :func:`queue.claim_one`：默认全租户共享，
+    需要隔离（或测试里只跑自己的队列）时收紧。
+    """
     async with WorkerSession() as session:
         task = await queue.claim_one(
-            session, worker_id=worker_id, agent=agent, lease_seconds=lease_seconds
+            session,
+            worker_id=worker_id,
+            agent=agent,
+            workspace_id=workspace_id,
+            lease_seconds=lease_seconds,
         )
         if task is None:
             return None

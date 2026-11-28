@@ -518,6 +518,33 @@ class ToolDecision(BaseModel):
 
 这套机制让「同一份计划能否复现」成为可测命题，也是后续所有 Agent 回归测试的基础设施。
 
+**解析不过的输出不进回放。** 回放只证明「那次 HTTP 成功了」，不证明「那段文本能用」。
+把一段连 JSON 都解析不了的回答留在缓存里，等于把所有重试固定成同一个失败 ——
+报错位置连字符数都一样，看起来像模型固执，实际是在复读。所以 ``call_structured``
+一旦解析失败（语法或 schema 都算），就先 ``forget_replay`` 把键摘掉；如果命中的
+本来就是回放（``replayed=True``），还会立刻真问一次，且不消耗那唯一一次修复机会。
+修复提示也换了口径：不再只说「第 20 行第 1 列解析失败」，而是把出错处附近的原文
+一起给模型 —— 位置它改不动，原文它改得动。
+
+**「合法 JSON」由解码保证，不是靠 prompt 求出来的。** 结构化调用（``call_structured``）
+现在带 ``response_format={"type":"json_object"}``，把 ``temperature`` 压到 0.2。
+起因是一次真实的双重失败：同一份 ``DeepenResult``，第一次把 ``evidence`` 数组
+写进了 ``counterpoints`` 里（``"证据": [`` 这种数组里写键的写法根本不是 JSON），
+第二次（修复调用）在 ``"claim":`` 换行之后直接写了一整句中文，没有引号 ——
+报错是 ``Expecting value: line 20 column 1``。两次 ``finish_reason`` 都是 ``stop``，
+输出是完整的，所以**不是**被 ``max_output_tokens`` 截断（这一点查了用量才确认：
+1510 / 1049 tokens，上限 2000）。0.7 的温度对长嵌套 JSON 太松。
+
+``response_format`` 是否被网关支持因服务商而异，所以 provider 里留了一条退化路径：
+若报错信息里出现 ``response_format``，去掉该字段重发一次，退回「prompt 约束」的老办法。
+
+还有一处**收得很窄**的容错：``runtime._quote_bare_values``。它只处理「键独占一行、
+值裸写在下一行」这一种坏法，给值补上引号，而且补完必须重新通过 ``json.loads``
+与 schema 校验才会被采用 —— 所以最坏情况是回到原来的报错，不会把能用的输出判死，
+也不会把坏的拼成看起来合法的东西。值里已经带引号、或值本来是对象/数组中括号的，
+一律不动：那些加引号会改错语义，宁可交回模型重答。补了就写 ``agent.json_repaired``
+日志，不静默。
+
 ---
 
 ## 5. 工具层
@@ -689,28 +716,72 @@ UPDATE tasks
 | 契约 | `tests/sql/agent_check.sql`：状态机 64 组合 + 三种创建顺序 + fencing |
 | 并发 | `tests/test_worker.py`：12 worker × 20 任务 + 旧代次写入被拒 |
 
+### 8.5 进程心跳：谁在消费队列
+
+队列是**拉**模型，所以「worker 挂了」和「worker 在忙」在数据上完全一样：任务都是
+`READY`，没有 `started_at`，没有任何错误。没有外部观察者时，这个状态会一直持续到
+界面超时，而超时只说「没等到」，不说原因。
+
+worker 每 5 秒往 Redis 写一个带 TTL 的键（`cache/heartbeat.py`）：
+
+```
+SET xing:worker:<worker_id> '{"worker_id":...,"agent":...,"beat":...}' EX 30
+```
+
+**心跳由独立协程发，不跟着主循环**。主循环跑一个 expand 要 30~40 秒、跑一趟带补采的
+检测更久，跟着它写心跳就会在「正在干活」的时候过期 —— 那是把正确状态报成故障，
+比不报更糟。退出时（SIGTERM 走到 `finally`）主动 `DEL`，SIGKILL 则等 TTL 自然过期：
+最坏 30 秒的误报方向是「还有人活着」，保守但不危险。
+
+读侧有两个出口，都只是把心跳和队列放在一起看：
+
+| 出口 | 给出什么 |
+| --- | --- |
+| `GET /workspaces/{ws}/queue/status` | `workers_online` / `queued` / `running` / `oldest_wait_s` / `stalled` |
+| `GET /topics/{id}/chain` | 每环 `waiting_s` + 全局 `workers_online` |
+
+`stalled = queued > 0 and workers_online == 0` 是派生结论，不是新状态：它不过是把
+「有东西等着被消费」和「没有人在消费」两句话连起来。界面据此把「执行中」改成
+「排队 2 分 10 秒，没人领取」，这也修正了一个长期的语义错误 —— `READY` 从来不是
+「执行中」，它只是「等着被执行」。
+
+> 心跳解决的是**可见性**，不是吞吐。当前仍是单进程单任务串行：一条 expand 排在
+> 一条 deepen 后面就得等。要提吞吐得开并发池或按 agent 拆进程，那时
+> `worker_id` 天然是多值的，接口不需要改。
+
 ---
 
 ## 9. 代码结构
 
-评审稿提出 `src/xing/agents/` 下 13 个子目录。实际按当前代码量，8 个文件封顶：
+评审稿提出 `src/xing/agents/` 下 13 个子目录。实际按当前代码量，13 个文件、零子目录：
 
 ```
 src/xing/agents/
     __init__.py
-    base.py           # Agent 协议 + §4.2 单步循环
-    runtime.py        # 预算记账、录制回放、llm_calls 写入
-    orchestrator.py   # 计划分解、派发、汇聚
-    planner.py
-    researcher.py
+    pricing.py        # 价格表 + 预留额上界计算
+    provider.py       # LLM 供应商适配（stub / openai 兼容）
+    runtime.py        # 预算记账、录制回放、llm_calls 写入、call_model/call_structured
+    upstream.py       # 读 depends_on 各任务 output，只取指针
+    schemas.py        # 全部输出 Pydantic + 对应 shape
+
+    # 一条 goal → 内容（§13）
+    planner.py        # 计划分解
+    researcher.py     # 子任务研究（窄检索）
     writer.py
     reviewer.py       # 窄事实核查，非综合评审
-    schemas.py        # 全部输出 Pydantic
 
-src/xing/agents/tools/
+    # 一个事件/方向 → 选题（§14）
+    expander.py       # 采舆论 → 抽立场 → 生成引用立场的候选
+    opinion.py        # 舆论检测闸门
+    scorer.py         # 打分排序（先 tier 再 overall）
+    deepener.py       # 深入取证
+
+src/xing/search/
     __init__.py
-    registry.py       # ToolSpec + 全局注册表
-    contracts.py      # 现有 7 个 service 的薄封装
+    base.py           # Searcher 协议 + SearchDoc / SearchHit
+    stub.py
+    tavily.py
+    qwen.py           # 走 runtime.call_model(web_search=True)
 
 src/xing/worker/
     __init__.py
@@ -718,7 +789,9 @@ src/xing/worker/
     runner.py         # 执行、心跳、租约
 ```
 
-【冻结】不预建 `memory/`、`evaluation/`、`policy/`、`observability/` 等空目录。目录跟着代码长；先摊开架构图再填代码，最后产出的是长得像架构的空壳。
+【冻结】不预建 `memory/`、`evaluation/`、`policy/`、`observability/` 等空目录，也不建 `tools/`
+（没有第二实现时的工具抽象是负担）。目录跟着代码长；先摊开架构图再填代码，
+最后产出的是长得像架构的空壳。
 
 ---
 
@@ -949,10 +1022,139 @@ LLM_ENABLE_THINKING=false
 | 3 | 9 张 `agent_*` 新表 | 净增 1 张 | 无写入方的表是猜测 |
 | 4 | `budget` / `spent` 用 jsonb | 6 个数值列 + CHECK | JSONB 内数值无法硬拦截 |
 | 5 | `Review Agent` | `ReviewService` + 窄核查 Agent | 宽口径评审无法验收 |
-| 6 | `agents/` 13 个子目录 | 8 文件 + 2 子包 | 目录跟代码长，不预摊 |
+| 6 | `agents/` 13 个子目录 | 13 文件 + 零子目录 | 目录跟代码长，不预摊 |
 | 7 | MCP 可选层 | Phase 4，且不改 `ToolSpec` | 没有第二实现时的抽象是负担 |
 | 8 | Memory 读写同时建 | Phase 1 只读，不建表 | 先解决"读得到"，再解决"记得住" |
 
 ---
 
-*修订记录：v1 2026-11-25 首版冻结；v1.1 同日，Phase 1b 落地后按实现回填（§11）。*
+## 14. 选题链与检索层（v0.4，已落地）
+
+§13 那条图是从「一句 goal」出发的。产品主干是另一条：从「一个事件/方向」出发，
+先选题再写。两条链共用同一套 Runtime，差别只在图的形状与**有没有检索**。
+
+```
+expand_topics ──▶ check_opinion ──▶ score_topics ──▶ (人选定) ──▶ deepen_topic ──▶ write_content ──▶ review_content
+   ↑ 3~5 次检索（必须）   ↑ 闸门，不通则不排产        ↑ 自动排产        ↑ 2~5 次检索（必须）
+```
+
+| Agent | task_type | 模型调用 | 检索 | 写的表 |
+| --- | --- | --- | --- | --- |
+| Expander | `expand_topics` | 1×`plan` + 1×`analyze` + 1×`generate`（缺阵营时 +1×`analyze`，补采的 query 查表生成） | 3~5 次（必须，并发），补采再 +≤3 次（并发） | `opinion_stances`、`topic_stances`、`topics`(CANDIDATE) |
+| OpinionChecker | `check_opinion` | 1×`self_check` | — | `topics.brief.opinion`、`topics`(REJECTED) |
+| Scorer | `score_topics` | 1×`self_check` | — | `topics`(分数/状态) |
+| Deepener | `deepen_topic` | 1×`plan` + 1×`generate` | 2~5 次（严格） | `external_events`、`topic_events`、`topics.brief` |
+| Writer | `write_content` | 1×`generate` | — | `contents`、`content_versions` |
+| Reviewer | `review_content` | 1×`self_check` | — | `approvals`(INSERT) |
+
+写作的篇幅按内容类型定档（v0.4）：`write_content` 原来固定 `max_output_tokens=1600`，
+prompt 里又写着「不强制固定字数」，模型只看到一句「类型：VIDEO_SCRIPT」——于是
+成稿普遍 700~1100 字。现在 `LENGTH_GUIDES` 给每种类型一组 `floor / target /
+ceiling / max_tokens`（文章 1400 / 1800 / 2600 / 4000），写进 prompt，也写进
+`content_versions.metadata`（`char_count`、`length_floor`、`short`）。
+
+审核侧对同一个下限做**机检**：字数算得出来，不该让 judge 估。低于下限的 80%
+直接 FAIL（没写完），80%~下限之间记一条 issue 并扣 15 分（收尾仓促）—— 两者
+返工方式不同。下限优先取 metadata 里写作时记的值，改了档位不会让旧稿追溯性变短。
+
+### 14.0 展开为什么是三次调用而不是一次
+
+一次调用里「想角度 + 顺手编个理由」是模型最省力的路径，也是这一环最早出问题的地方：
+切面看起来合理，但没有任何人这么说过。v0.3 把它拆成**先采舆论、再抽立场、最后才生成**，
+三次调用之间各有一道机检，模型没有捷径可走。
+
+```
+plan(3~5 条 query，必须含 OPPOSE/VOICE/SEGMENT) ──▶ 真实检索（并发）
+  ──▶ analyze(抽立场，每条必须带原文 quote) ──▶ 机检：quote 必须是材料子串
+  ──▶ [缺声音阵营?] 查表生成 ≤3 条 query ──▶ 换一批材料 ──▶ analyze
+  ──▶ generate(候选，每条必须给 stance_indexes) ──▶ 机检：引用落空即丢弃
+```
+
+第三段是可选的补采：第一轮抽完只覆盖了部分阵营时，针对缺失的
+`SUPPORT` / `OPPOSE` / `CONDITIONAL` / `EXPERIENCE` 再采一轮。`OBSERVER` 不补
+—— 旁观评论不是分歧的一方，为它多跑一轮只会带回跑题材料（真实跑踩过一次）。
+补采用满时一个 run 是 4 次调用，所以 `max_steps=9`（每步留一次 repair）。
+
+**补采的 query 不调模型**（v0.4）：缺口是确定的（缺哪一类声音），措辞也是确定的，
+再问一次模型只换来 4~5 秒的空等。改成 `_SUPPLEMENT_QUERIES` 模板 + 种子核心词，
+代价是 query 比模型写的窄 —— 实测模型规划能补回 3 条立场、模板补回 1 条，
+但补采本来只是「换一组词再搜一次」，不是重新规划。核心词必须先剥掉种子的
+`方向：`/`事件：` 标签，否则「方向」两个字会被当成主题。
+
+禁止先验不靠提示词里的「不要编」，靠结构：
+
+- `GroundedCandidate.stance_indexes` 是 `min_length=1` 的必填字段 —— 模型不引用就出不了 schema；
+- `_ground()` 把引用为空或全部越界的候选丢掉，全丢则 `NO_GROUNDED_CANDIDATE` 终态；
+- `topic_stances` 两侧都是 `(id, workspace_id)` 复合外键 —— 引用必须指向本租户真实存在的立场行。
+
+检索为空（`NO_OPINION_SOURCE`）、立场全部机检不过（`NO_STANCE_EXTRACTED`）、
+真实检索下立场不足 3 个或阵营不足 2 个（`OPINION_TOO_THIN`）都是不可重试终态：
+没有舆论就不该出题，重试只会让模型开始编。
+
+### 14.1 舆论检测是闸门，不是打分
+
+`check_opinion` 是独立 task、独立 run，只看得到「立场池 + 候选」，看不到生成过程 ——
+与打分独立同源：同一上下文自评必然偏松。判定三档：
+
+| verdict | 含义 | 后果 |
+| --- | --- | --- |
+| `GROUNDED` | 切面确实对应池里的具体立场，且能指名受众 | 进入打分 |
+| `WEAK` | 立场沾边但受众含糊，或与其他候选重复 | 进入打分，但排在 `GROUNDED` 之后 |
+| `UNGROUNDED` | 切面不来自任何立场（模型先验 / 换皮） | `topics.status = REJECTED`，不排打分 |
+
+**换皮判定不交给模型**。两个候选的 `(frozenset(stance_ids), audience)` 相同是结构事实，
+机检算出来就降 `WEAK`，模型判 `GROUNDED` 也不改。判 `GROUNDED` 而 `audience_identified`
+为假，同样降 `WEAK`。
+
+它**不判真假**。prompt 里明写「不要判断事实真假、不要因为观点不正确就判 UNGROUNDED」，
+真假是 `deepen_topic` 的事 —— 展开阶段能保证的只有「有人这么说过」，不能保证「说得对」。
+
+覆盖度（材料数、来源数、阵营分布、`missing_camps`）由 SQL 聚合，不经模型，
+写进 `brief.opinion.coverage`。真实跑出 `missing_camps=[CONDITIONAL, EXPERIENCE]`
+时不补假数据，如实记录 —— 缺口要能被看见。
+
+排序分两层：先按 `tier`（`GROUNDED`=0 / `WEAK`=1），再按 `overall`。
+`REJECTED` 的候选不进打分集合，前端按钮直接禁用。
+
+### 14.2 检索为什么是一个独立目录
+
+`src/xing/search/`：`SearchDoc` 的字段直接对齐 `external_events` 的列，
+所以「搜索结果 → 证据」不需要任何映射层。三个后端（stub / tavily / qwen）
+前提不同，但调用方只看到 `Searcher.search(query) -> SearchHit`。
+
+`qwen`（模型端联网）**走 `runtime.call_model(web_search=True)`**，不自己发 HTTP。
+这不是洁癖：一次联网检索约 7000 input tokens，绕开 Runtime 就等于绕开预算。
+两个配套代价都写进了 `runtime`：
+
+- `make_replay_key` 升到 v2，带/不带联网是两个键（否则回放会把「没联网的回答」
+  当成检索结果）；
+- 预留额度加 `settings.search_context_chars`，因为检索正文是供应商注入的，
+  不在我们发的 prompt 字符数里 —— 不加就违反「预留是花费上界」。
+
+### 14.3 证据的可核性靠机检，不靠 judge
+
+`topic_events.quote`、`opinion_stances.quote` 落库前都必须是 `external_events.summary`
+的子串（折叠空白后）。模型可以改写 `claim`，但不能改写引文。这一步没有模型参与，
+所以结论可复现 —— 交给 LLM judge 判断「意思是否相近」，恰恰最容易被相似措辞骗过。
+
+两层对引文的处理不同，这是有意的：
+
+- **立场层**（展开）：引文不过就丢这条立场，`dropped_stances` 计数。立场是选题的地基，
+  地基里混进改写过的引文，后面所有「有据可依」都成了空话。
+- **证据层**（深入）：引文不过不失败，用材料原文兜底成 BACKGROUND，并在
+  `brief.search.degraded / rejected_quotes` 留痕。深入阶段已经有真材料在手，
+  降级比中止更有用，但降级必须可见。
+
+### 14.4 手工跑一遍
+
+`scripts/run_topic_chain.py`（不进 CI）：建临时 workspace，跑完整七环，
+打印 brief / 立场池 / 证据 / 成稿 / 成本。stub 只能证明管道接对了，真实跑的失败模式
+（结构化输出不合格、检索无结果、引文全是改写、立场凑不够 3 个）只有在这里才会出现。
+
+---
+
+*修订记录：v1 2026-11-25 首版冻结；v1.1 同日，Phase 1b 落地后按实现回填（§11）；
+v1.2 2026-11-26，选题链补上深入与检索层（§14）；
+v1.3 同日晚，展开改为舆论驱动 + 新增舆论检测闸门（§14.0 / §14.1）；
+v1.4 同日，展开补上缺失阵营补采（§14.0 第三段）；
+v1.5 同日晚，补采改模板 query、检索并发、写作按类型定篇幅 + 审核机检（§14）。*

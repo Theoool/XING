@@ -17,3 +17,5 @@ for module in (
     dev,
 ):
     router.include_router(module.router)
+
+router.include_router(tasks.queue_router)

@@ -19,6 +19,7 @@ usage() {
   up          启动全部服务
   worker      启动后台执行进程（profile: worker，默认不跑）
   workerlog   跟踪 worker 日志
+  workerrestart 重启 worker（改过 src/ 后必须执行：它不热重载）
   build       重建 api 镜像（改了 pyproject.toml 后必须执行）
   down        停止并移除容器（保留数据卷）
   stop        仅停止容器
@@ -62,6 +63,10 @@ case "$cmd" in
   ps)        "${COMPOSE[@]}" ps ;;
   worker)    "${COMPOSE[@]}" --profile worker up -d worker ;;
   workerlog) "${COMPOSE[@]}" --profile worker logs -f worker ;;
+  # worker 跑的是 `python -m xing.worker.main`，启动时把模块导入内存，改 src/ 对它
+  # 无效。API 那边有 --reload，很容易让人以为「都热重载了」—— 这个子命令就是
+  # 为了让那条假设不成立时有一个不需要记住的命令。
+  workerrestart) "${COMPOSE[@]}" --profile worker restart worker ;;
   sh)        "${COMPOSE[@]}" exec api bash ;;
   db)        "${COMPOSE[@]}" exec db psql -U "${POSTGRES_USER:-xing}" -d "${POSTGRES_DB:-xing}" ;;
   redis)     "${COMPOSE[@]}" exec redis redis-cli ;;

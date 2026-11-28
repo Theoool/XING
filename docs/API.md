@@ -222,13 +222,15 @@ workspace_id = app.current_workspace_id() AND app.is_workspace_member(workspace_
 | GET | `/workspaces/{workspace_id}/events` | 列表（键集分页） |
 | GET | `/workspaces/{workspace_id}/events/{event_id}` | 详情 |
 
-### 选题（5）
+### 选题（7）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/workspaces/{workspace_id}/topics/recommend` | 推荐（打分排序，幂等） |
 | GET | `/workspaces/{workspace_id}/topics` | 列表 |
 | GET | `/workspaces/{workspace_id}/topics/{topic_id}` | 详情 |
+| GET | `/workspaces/{workspace_id}/topics/{topic_id}/chain` | 链路状态（七环派生） |
+| POST | `/workspaces/{workspace_id}/topics/{topic_id}/chain/retry` | 重跑失败环节 |
 | POST | `/workspaces/{workspace_id}/topics/{topic_id}/select` | 选定（自动写决策） |
 | POST | `/workspaces/{workspace_id}/topics/{topic_id}/reject` | 拒绝（自动写决策） |
 
@@ -255,14 +257,16 @@ workspace_id = app.current_workspace_id() AND app.is_workspace_member(workspace_
 | POST | `/workspaces/{workspace_id}/contents/{content_id}/reject` | 审核驳回 |
 | GET | `/workspaces/{workspace_id}/contents/{content_id}/approvals` | 审批历史 |
 
-### 任务（4）
+### 任务（6）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/workspaces/{workspace_id}/tasks` | 创建任务 |
 | GET | `/workspaces/{workspace_id}/tasks` | 列表 |
 | GET | `/workspaces/{workspace_id}/tasks/{task_id}` | 详情（轮询用） |
+| GET | `/workspaces/{workspace_id}/tasks/{task_id}/trail` | 取证轨迹（检索/思考/立场） |
 | POST | `/workspaces/{workspace_id}/tasks/{task_id}/cancel` | 取消（`?reason=`） |
+| GET | `/workspaces/{workspace_id}/queue/status` | 队列状态（有没有 worker 在消费） |
 
 ### 开发辅助（1）
 
@@ -413,6 +417,20 @@ workspace_id = app.current_workspace_id() AND app.is_workspace_member(workspace_
 
 `workspace_id` 出现在响应里，因为战略可以被跨工作区引用比对（未来 Pattern 层会用到）。
 
+**配置被谁读**（决定「该写什么」和「该写多长」）：
+
+| 消费方 | 用法 |
+|---|---|
+| `agents/expander.py` | 整份配置 `json.dumps(..., ensure_ascii=False)[:1500]` 进候选提示词 |
+| `agents/scorer.py` | 同上，进评分提示词 |
+| `services/topic_service.py` | 遍历所有字符串，当作事件相关度的关键词 |
+| `decisions.strategy_version_id` | 选定那一刻钉住具体版本，之后改战略不追溯 |
+
+最后一条是版本化存在的理由：`strategy_config` 没有 schema，字段名只是给人读的，
+但**长度有硬后果** —— 超过 1500 字符的部分模型看不到，而且截断点落在 JSON 中间。
+`jsonb` 不保留插入顺序（键顺序由数据库决定），所以「把重要字段写在前面」在这里
+不成立：能控的只有总量。
+
 ### GET /workspaces/{workspace_id}/strategies
 
 按 `created_at DESC` 返回该工作区全部战略，每个都带当前版本。无分页。
@@ -497,6 +515,56 @@ workspace_id = app.current_workspace_id() AND app.is_workspace_member(workspace_
 
 **响应 200**：`StrategyOut`
 **错误**：`404 STRATEGY_NOT_FOUND`
+
+### PATCH /workspaces/{workspace_id}/strategies/{strategy_id}
+
+只改 `name`。配置不在这里改 —— 配置是版本化内容。
+
+```json
+{ "name": "2026 Q4 内容战略（改）" }
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 1–100 |
+
+**响应 200**：`StrategyOut`
+
+**错误**：`404 STRATEGY_NOT_FOUND`、`422 VALIDATION_ERROR`、`403 WORKSPACE_FORBIDDEN`
+
+> 不动 `current_version_number`，也不动 `lock_version` —— 后者记的是「配置改过几次」，
+> 名字不是配置。`updated_at` 由触发器维护。
+
+### GET /workspaces/{workspace_id}/strategies/{strategy_id}/versions
+
+版本历史，`version_number DESC`（新到旧）。
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `limit` | int | 20 | 1–100 |
+
+**响应 200**：`StrategyVersionListOut[]`
+
+```json
+[
+  {
+    "id": "0193f2b5-3333-7c4e-8a3b-0f5c8b6e4a12",
+    "version_number": 2,
+    "strategy_config": { "tone": "克制、具体、有数据" },
+    "change_summary": "补充独立开发者方向",
+    "created_by": "0193f2a0-1111-7c4e-8a3b-0f5c8b6e4a12",
+    "created_at": "2026-11-24T09:03:00+00:00",
+    "is_current": true
+  }
+]
+```
+
+`is_current` 由服务端按父行 `current_version_number` 判定，前端不自己比对。
+
+**错误**：`404 STRATEGY_NOT_FOUND`（战略不属于该工作区时也是 404，不是空列表）
+
+> 版本是**不可变快照**，没有「回滚」接口。想回到旧配置，只能把那一版的内容
+> 作为 `POST /versions` 的请求体再提交一次 —— 历史因此始终完整。
 
 ### POST /workspaces/{workspace_id}/strategies/{strategy_id}/versions
 
@@ -760,6 +828,8 @@ GET /events?source_type=NEWS&q=AI
 | `risk_score` | float \| null | 当前恒 null |
 | `discovered_at` | timestamp | |
 | `selected_at` | timestamp \| null | |
+| `seed_task_id` | uuid \| null | 产出这条选题的那次「展开」任务。有了它才能从选题点进 `/trail` 看取证过程；为空说明不是展开产出的（手工建 / 老数据），前端据此隐藏入口而不是给一个死链 |
+| `brief` | object \| null | 展开/深入产出：`angle`/`audience`/`thesis`/`why_now`/`stances`/`opinion`/`outline`/`evidence_refs`/`search` |
 
 ### POST /workspaces/{workspace_id}/topics/{topic_id}/select
 
@@ -786,6 +856,12 @@ GET /events?source_type=NEWS&q=AI
 | 404 | `TOPIC_NOT_FOUND` | |
 | 409 | `TOPIC_NOT_SELECTABLE` | 状态不是 `CANDIDATE`/`RECOMMENDED`（已选、已拒、已过期、已用过） |
 | 409 | `NO_ACTIVE_STRATEGY` | 决策必须绑定战略版本，没有 ACTIVE 就写不了 |
+| 409 | `OPINION_PENDING` | 舆论检测还没完成（`brief.opinion.checked` 不是 true） |
+| 409 | `OPINION_UNGROUNDED` | 检测结论不是 `GROUNDED`/`WEAK` |
+
+> 舆论检测与选定是两个独立请求，中间有 8~15 秒窗口。`check_opinion` 只捞
+> `CANDIDATE`/`RECOMMENDED`，已 `SELECTED` 的题会被排除 —— 所以闸门放在这里拒绝，
+> 而不是只靠界面禁用按钮。
 
 **并发**：先 `SELECT ... FOR UPDATE` 锁选题行，双击不会产生两条决策。
 
@@ -804,6 +880,70 @@ GET /events?source_type=NEWS&q=AI
 **响应 200**：`TopicOut`（`status = REJECTED`）
 
 **错误**：同 select（`404` / `409 TOPIC_NOT_SELECTABLE` / `409 NO_ACTIVE_STRATEGY`）
+
+### GET /workspaces/{workspace_id}/topics/{topic_id}/chain
+
+把七环的进度合成一个答案。**派生接口**：不写任何表，全部从 `tasks`（按 `dedup_key`
+定点查）、`topics.status`、`contents` 现算 —— 再存一张 `chains` 表就会有第二个真相。
+
+**响应 200**
+
+```json
+{
+  "topic_id": "0193f2d0-5555-7c4e-8a3b-0f5c8b6e4a12",
+  "seed_task_id": "0193f2b0-3333-7c4e-8a3b-0f5c8b6e4a12",
+  "phase": "FAILED",
+  "steps": [
+    { "key": "expand", "label": "展开", "status": "DONE", "task_id": "...", "error": null, "retryable": false, "waiting_s": null },
+    { "key": "opinion", "label": "舆论检测", "status": "DONE", "task_id": "...", "error": null, "retryable": false, "waiting_s": null },
+    { "key": "score", "label": "评分", "status": "DONE", "task_id": "...", "error": null, "retryable": false, "waiting_s": null },
+    { "key": "select", "label": "选定", "status": "DONE", "task_id": null, "error": null, "retryable": false, "waiting_s": null },
+    { "key": "deepen", "label": "深入", "status": "DONE", "task_id": "...", "error": null, "retryable": false, "waiting_s": null },
+    { "key": "write", "label": "成稿", "status": "FAILED", "task_id": "...", "error": { "code": "MODEL_TIMEOUT", "message": "模型超时" }, "retryable": true, "waiting_s": null },
+    { "key": "review", "label": "审核", "status": "PENDING", "task_id": null, "error": null, "retryable": false, "waiting_s": null }
+  ],
+  "content_id": null,
+  "review": null,
+  "can_select": false,
+  "select_blocked_reason": "TOPIC_NOT_SELECTABLE",
+  "failed_step": "write",
+  "workers_online": 1
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `phase` | `EXPANDING` / `CHECKING` / `SCORING` / `AWAITING_SELECTION` / `DEEPENING` / `WRITING` / `REVIEWING` / `DONE` / `FAILED` / `REJECTED` |
+| `steps[].status` | `PENDING`（未排产）/ `WAITING`（已排产待领取）/ `RUNNING` / `RETRYING` / `DONE` / `FAILED` / `CANCELLED` / `SKIPPED` |
+| `steps[].retryable` | 只有 `FAILED`/`CANCELLED` 的任务为 true（已选定但深入没排产也是 true） |
+| `steps[].waiting_s` | `WAITING` 已等了多久（秒）。它是「排队」与「没人来领」的唯一区分线索，所以由后端算 |
+| `workers_online` | 存活 worker 数。`0` = 没有进程在消费队列，`WAITING` 不会自己变成 `RUNNING`；`null` = 读不到 |
+| `can_select` | 能否选定；false 时 `select_blocked_reason` 给出机器可读原因 |
+| `review` | 审核任务的 `output`：`{verdict, score, issues}` |
+
+**错误**：`404 TOPIC_NOT_FOUND`
+
+### POST /workspaces/{workspace_id}/topics/{topic_id}/chain/retry
+
+重跑一个失败环节。只允许 `deepen` / `write` / `review` —— `expand` 重跑会换掉整批候选，
+`opinion`/`score` 重跑没有意义。
+
+```json
+{ "step": "write" }
+```
+
+**响应 200**：`ChainStatus`
+
+**错误**
+
+| 状态 | code | 场景 |
+|---|---|---|
+| 409 | `STEP_NOT_RETRYABLE` | 该环节还没失败（或已重排、正在跑） |
+| 409 | `STEP_NOT_FOUND` | 没有可复制的原任务；或上游环节还没成功 |
+| 409 | `TOPIC_NOT_SELECTED` | 还没选定就想重跑写作/审核 |
+
+**幂等**：失败任务的 `dedup_key` 被置空，新任务接管同一个键 —— 历史里仍能看到失败那次，
+但「同一环节只有一条活任务」不变。输入从失败任务复制，重试的是同一次写作。
 
 ---
 
@@ -1239,6 +1379,130 @@ POST /workspaces/{workspace_id}/tasks/{task_id}/cancel?reason=用户放弃
 > 当前 `cancel` 只改数据库状态。真正停掉一个正在跑的进程需要 worker 侧配合
 > （检查租约 / 终止子进程）。`RUNNING` 的取消会在租约续期失败时被 worker 感知，
 > 见 `docs/AGENT_DESIGN.md` §8.2。
+
+### GET /workspaces/{workspace_id}/tasks/{task_id}/trail
+
+**取证**：这个任务到底怎么搜的、搜到什么、为什么留/丢、从哪句话抽出了什么立场、
+模型每一步的原文。和 `/tasks/{task_id}` 分开是因为用途相反 —— 详情是 4 秒一次的
+轮询路径，要小；轨迹是排查时才会打开，载荷大且几乎不变。
+
+**响应 200**：`TaskTrace`
+
+```json
+{
+  "task_id": "…",
+  "task_type": "expand_topics",
+  "status": "SUCCEEDED",
+  "attempt": 1,
+  "run_id": "…",
+  "agent": "expander",
+  "rounds": [
+    {
+      "round": 0,
+      "query_count": 5,
+      "result_count": 30,
+      "new_count": 18,
+      "source_mix": { "UNKNOWN": 10, "MEDIA": 5, "UGC": 3 },
+      "queries": [
+        {
+          "seq": 1,
+          "layer": "MEDIA",
+          "query": "远程办公三年后强制回公司 员工离职",
+          "target": "OPPOSE",
+          "provider": "tavily",
+          "options": {},
+          "status": "OK",
+          "latency_ms": 2544,
+          "result_count": 6,
+          "new_count": 6,
+          "docs": [
+            {
+              "rank": 1,
+              "title": "…",
+              "url": "https://cn.weforum.org/…",
+              "domain": "cn.weforum.org",
+              "source_kind": "UNKNOWN",
+              "kind_rule": "unclassified",
+              "source_kind_now": "OFFICIAL",
+              "kind_rule_now": "domain:weforum.org",
+              "kept": true,
+              "drop_reason": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "steps": [
+    { "step_no": 1, "purpose": "plan", "model": "dashscope/qwen-max",
+      "latency_ms": 4210, "cost": 0.0132, "system": "…", "prompt": "…", "response": "…" }
+  ],
+  "stances": [
+    { "label": "具体经办人被夹在中间", "camp": "OPPOSE", "quote": "…" }
+  ],
+  "summary": {
+    "query_count": 7, "doc_count": 42, "kept_count": 26,
+    "stance_count": 5, "source_mix": { "UNKNOWN": 17 }, "ugc_ratio": 0.12
+  }
+}
+```
+
+四个字段值得单独说：
+
+- **`options`** 是**真正下发**的参数，不是调用方以为的参数。provider 执行完把生效值
+  回传，轨迹记这个。所以「讨论层到底有没有限定站点」是可以被核对的，不用信任代码。
+- **`kind_rule`** 是命中的分类规则（`domain:zhihu.com` / `suffix:.gov.cn` /
+  `pattern:lawyer` / `unclassified`）。判定错的时候先看这一条，再看结果。
+- **`source_kind` 与 `source_kind_now`**：前者是**当时**的判定，永远不改；后者只在
+  分类表后来变过、今天会判成别的时才出现。两个答案都给，是因为只留旧的会让人
+  以为分类器认不出来，而改写旧的等于篡改取证记录。
+- **`drop_reason`** 分三种：`EXCLUDED_PREVIOUS_ROUND`（补采时上一轮已有）、
+  `DUPLICATE`（本轮 query 间撞车）、`OVER_LIMIT`（超上限）。处置方式不同，不能合并。
+
+**错误**：`404 TASK_NOT_FOUND`
+
+> 轨迹只增不改：`xing_app` / `xing_worker` 对该表只有 `SELECT, INSERT`，
+> 由迁移 `0012` 与 `scripts/app_role.sql` 双重保证（`tests/sql/p0_check.sql` 的 P0-6 守着）。
+
+### GET /workspaces/{workspace_id}/queue/status
+
+队列的可观察面。**「任务一直不动」有两个完全不同的原因**：前面排着队，或者根本没人来领。
+任务列表分不出这两者 —— 两种情况下它们都是 `READY`。
+
+**响应 200**
+
+```json
+{
+  "workers_online": 0,
+  "queued": 1,
+  "running": 0,
+  "oldest_wait_s": 312,
+  "stalled": true
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `workers_online` | 存活 worker 数。worker 每 5 秒往 Redis 写一次心跳（`xing:worker:<id>`，TTL 30 秒） |
+| `queued` | `PENDING` + `READY` 的任务数 |
+| `running` | `RUNNING` + `RETRYING` 的任务数 |
+| `oldest_wait_s` | 最早一条未被领取的任务等了多久；没有排队时为 `null` |
+| `stalled` | 有任务在排队、或卡在执行中，却没有任何 worker 在跑 —— 它们不会自己往前走 |
+
+`stalled` 不是新状态，是两件事的结论。心跳给的是「现在有没有进程在消费」，
+`queued` / `running` 给的是「有没有东西等着被消费、或正被一个已经死掉的进程握着」；
+只看其中任何一个都解释不了现场。
+
+`running > 0` 也算停住：租约回收（`reclaim_expired`）同样长在 worker 的主循环里，
+worker 全掉线时那条 `RUNNING` 任务没有任何人会回收，会永远停在执行中 —— 它看起来
+最像「在跑」，实际上最不该等。
+
+**超时语义**：心跳 TTL 30 秒。进程被 SIGKILL 时来不及删键，最坏情况下线 30 秒后
+才变成 `workers_online = 0`，这是刻意的保守方向（宁可晚一点报死，也不要让正在跑的
+worker 因为一次 GC 停顿被误判）。
+
+> 心跳由独立协程发，不跟着主循环 —— 主循环跑一个 expand 会占住 30~40 秒，
+> 跟着它写心跳会在「正在干活」的时候过期。
 
 ---
 

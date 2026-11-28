@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +15,9 @@ class TopicOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
+    #: 产出这条候选的展开任务。前端据此跳到「取证过程」——
+    #: 「这个切面凭什么成立」的答案全在那个任务的轨迹里。
+    seed_task_id: UUID | None = None
     primary_event_id: UUID | None
     title: str
     description: str | None
@@ -25,6 +28,9 @@ class TopicOut(BaseModel):
     risk_score: float | None
     discovered_at: datetime
     selected_at: datetime | None
+    #: 深入产出的完整 brief（stage=EXPANDED / DEEPENED）。带 evidence_refs 与
+    #: search 元信息 —— 这是「这条选题值不值得写、依据是什么」对外的唯一出口。
+    brief: dict[str, Any] | None = None
 
 
 class TopicRecommendation(TopicOut):

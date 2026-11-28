@@ -52,8 +52,7 @@ async def reap_stale_runs(
             update(AgentRun)
             .where(
                 AgentRun.status == AgentRunStatus.RUNNING,
-                orphaned_task
-                | (AgentRun.started_at < datetime.now(UTC) - max_age),
+                orphaned_task | (AgentRun.started_at < datetime.now(UTC) - max_age),
             )
             .values(
                 status=AgentRunStatus.FAILED,
